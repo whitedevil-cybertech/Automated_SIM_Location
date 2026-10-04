@@ -16,7 +16,7 @@ from backend.app.models.enums import RequestState
 class ShareTokenInfo(BaseModel):
     """Secure, single-use token representation for IO authorization."""
 
-    token: str = Field(description="Random opaque token (UUID / high-entropy)")
+    token_hash: str = Field(description="SHA-256 hash of random opaque token")
     expires_at: datetime = Field(description="Expiration timestamp")
     is_used: bool = Field(default=False, description="Whether token has been redeemed")
     used_at: Optional[datetime] = Field(default=None, description="Redemption timestamp")

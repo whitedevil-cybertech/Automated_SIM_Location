@@ -38,20 +38,14 @@ async def test_openapi_schema_generation(async_client: AsyncClient):
     assert schema["info"]["version"] == "0.1.0"
     assert "/api/v1/health" in schema["paths"]
     assert "/api/v1/requests" in schema["paths"]
+    assert "/api/v1/request-links/{token}" in schema["paths"]
     assert "/api/v1/operators" in schema["paths"]
 
 
 @pytest.mark.asyncio
-async def test_request_endpoints_stub_501(async_client: AsyncClient):
-    """Verify Phase 2+ endpoints are defined but return 501 Not Implemented."""
-    response = await async_client.post(
-        "/api/v1/requests",
-        json={
-            "case_id": "FIR-2026-001",
-            "target_phone_number": "9876543210",
-            "operator_code": "JIO",
-        },
-    )
+async def test_phase3_request_endpoint_still_stubbed(async_client: AsyncClient):
+    """Verify Phase 3 endpoint remains intentionally stubbed."""
+    response = await async_client.post("/api/v1/requests/REQ-TEST-001/execute", json={})
     assert response.status_code == 501
     error_body = response.json()
     assert error_body["success"] is False
