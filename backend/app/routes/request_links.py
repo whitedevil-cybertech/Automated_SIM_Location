@@ -2,8 +2,13 @@
 
 from datetime import datetime, timezone
 import hashlib
-from fastapi import APIRouter, Path, Request, status
+from fastapi import APIRouter, Depends, Path, status
 
+from backend.app.core.auth import (
+    AuthenticatedPrincipal,
+    get_current_principal,
+    require_role,
+)
 from backend.app.core.database import db_manager
 from backend.app.core.exceptions import ResourceNotFoundError
 from backend.app.models.audit_log import AuditLogDocument
@@ -40,12 +45,16 @@ def _to_response(document: LocationRequestDocument) -> LocationRequestResponse:
     summary="Redeem secure tokenized request link",
 )
 async def access_request_link(
-    request: Request,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
     token: str = Path(..., min_length=24, description="Opaque share token"),
 ) -> ApiResponse[LocationRequestResponse]:
     """Redeem tokenized link for one-time request access."""
+    require_role(principal, UserRole.IO, UserRole.ADMIN)
+
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
-    data = await db_manager.location_requests.find_one({"share_token.token_hash": token_hash})
+    data = await db_manager.location_requests.find_one(
+        {"share_token.token_hash": token_hash}
+    )
     if not data:
         raise ResourceNotFoundError(message="Invalid or expired request link.")
 
@@ -78,17 +87,18 @@ async def access_request_link(
     if update_result.modified_count != 1:
         raise ResourceNotFoundError(message="Invalid or expired request link.")
 
-    actor_id = request.headers.get("x-actor-id", "").strip() or "DEV-IO-LINK-ACCESS"
     event = AuditLogDocument(
         request_id=document.request_id,
-        actor_id=actor_id,
-        actor_role=UserRole.IO,
+        actor_id=principal.principal_id,
+        actor_role=principal.role,
         event_type=AuditEventType.SHAREABLE_LINK_ACCESSED,
         details={"access_method": "token_link"},
     )
     await db_manager.audit_logs.insert_one(event.model_dump(mode="json"))
 
-    refreshed = await db_manager.location_requests.find_one({"request_id": document.request_id})
+    refreshed = await db_manager.location_requests.find_one(
+        {"request_id": document.request_id}
+    )
     if not refreshed:
         raise ResourceNotFoundError(message="Location request not found.")
     refreshed.pop("_id", None)

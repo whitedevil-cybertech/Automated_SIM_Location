@@ -83,8 +83,8 @@ Established a clean, modular structure consistent with `Architecture.md`:
 1. **Database Resilience & Safe Offline Fallback:**
    The backend connects asynchronously with a short ping timeout (`3000ms`). When MongoDB is unavailable locally, the application does not crash on startup; instead, it enters degraded mode, logs a warning, reports degraded health on `/health`, and raises `DatabaseConnectionError` when attempting database writes.
 2. **Forensic Evidence & Privacy First:**
-   Target numbers are stored in three representations:
-   - `target_phone_number`: Stored for authorized operations (designed for future field-level encryption).
+   Target numbers are stored in protected representations:
+   - `target_phone_encrypted`: Application-layer encrypted normalized phone for authorized backend operations.
    - `target_phone_masked`: Pre-computed masked display value (`+91 XXXXXX1234`) used in standard UI and logs.
    - `target_phone_hash`: SHA-256 non-reversible hash used for duplicate checking without exposing plaintext.
 3. **Hardware SMS Boundary:**

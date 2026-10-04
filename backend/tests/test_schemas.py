@@ -4,6 +4,8 @@ import hashlib
 import pytest
 from pydantic import ValidationError
 
+from backend.app.core.config import Settings
+from backend.app.core.field_crypto import SensitiveDataProtectionError, get_field_fernet
 from backend.app.models.enums import RequestState
 from backend.app.models.location_request import LocationRequestDocument
 from backend.app.schemas.location_request import LocationRequestCreate
@@ -72,7 +74,8 @@ def test_location_request_document_creation_and_masking():
 
     assert doc.request_id == "REQ-TEST-0001"
     assert doc.status == RequestState.CREATED
-    assert doc.target_phone_number == phone
+    assert doc.target_phone_encrypted != phone
+    assert doc.decrypt_target_phone_number() == phone
     # Verify masked format shows prefix and last 4 digits
     assert doc.target_phone_masked == "+91 XXXXXX3210"
     # Verify SHA-256 hash matches
@@ -80,3 +83,14 @@ def test_location_request_document_creation_and_masking():
     assert doc.target_phone_hash == expected_hash
     assert doc.created_at is not None
     assert doc.updated_at is not None
+
+
+def test_field_encryption_requires_explicit_key_outside_dev():
+    """Verify sensitive field crypto fails closed outside dev/testing without a key."""
+    settings = Settings(
+        app_env="production",
+        auth_mode="external",
+        field_encryption_key=None,
+    )
+    with pytest.raises(SensitiveDataProtectionError):
+        get_field_fernet(settings)

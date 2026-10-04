@@ -5,7 +5,7 @@ using pydantic-settings.
 """
 
 from functools import lru_cache
-from typing import Literal
+from typing import Dict, Literal, Optional
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -67,6 +67,31 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = Field(
         default=60,
         description="Access token lifespan in minutes",
+    )
+    auth_mode: Literal["development_static", "external"] = Field(
+        default="development_static",
+        description=(
+            "Authentication boundary. development_static is allowed only for "
+            "development/testing; production must use an external identity provider."
+        ),
+    )
+    development_auth_tokens: Dict[str, str] = Field(
+        default_factory=lambda: {
+            "dev-officer-token": "OFFICER-DEV-001:OFFICER",
+            "dev-io-token": "IO-DEV-001:IO",
+            "dev-admin-token": "ADMIN-DEV-001:ADMIN",
+        },
+        description=(
+            "Development-only bearer token mapping: token -> principal_id:ROLE. "
+            "Never use as production authentication."
+        ),
+    )
+    field_encryption_key: Optional[str] = Field(
+        default=None,
+        description=(
+            "Fernet key used for reversible encryption of sensitive MongoDB fields. "
+            "Required outside development/testing."
+        ),
     )
 
     # Operational lifecycle configuration

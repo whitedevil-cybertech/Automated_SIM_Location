@@ -145,3 +145,17 @@ Result:
 - **Phase 2 backend workflow implemented and tested.**
 - **OpenAPI includes new and updated Phase 2 endpoints.**
 - **No Phase 3/4 functionality was introduced.**
+
+---
+
+## Security Remediation Addendum — 2026-10-04
+
+The original Phase 2 implementation described above was remediated after P0 security validation.
+
+- `x-officer-id` and `x-actor-id` are no longer authoritative identity inputs.
+- Phase 2 endpoints now require bearer authentication through a clearly development-only static-token boundary; production/staging must use an external identity provider.
+- `submitting_officer_id` and audit `actor_id` are derived from the authenticated principal.
+- `GET /api/v1/requests/{request_id}` enforces owner/role authorization and returns 404 for unauthorized officer access.
+- Normalized target phone numbers are encrypted before MongoDB persistence; standard API responses expose only the masked phone value.
+- `POST /api/v1/requests` no longer returns a raw share-link token. Raw token delivery is limited to explicit `POST /api/v1/requests/{request_id}/share-link`; only token hashes are persisted.
+- Updated backend tests cover authentication, authorization, spoofing rejection, encrypted phone storage/recovery, share-token hash-only storage, replay, and expiry.

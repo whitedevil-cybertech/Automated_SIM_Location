@@ -4,8 +4,14 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import secrets
 from typing import Optional
-from fastapi import APIRouter, HTTPException, Path, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Request, status
 
+from backend.app.core.auth import (
+    AuthenticatedPrincipal,
+    can_access_request,
+    get_current_principal,
+    require_role,
+)
 from backend.app.core.config import get_settings
 from backend.app.core.database import db_manager
 from backend.app.core.exceptions import ResourceNotFoundError, ValidationException
@@ -22,12 +28,6 @@ from backend.app.schemas.location_request import (
 )
 
 router = APIRouter(prefix="/requests", tags=["Location Requests"])
-
-
-def _resolve_submitting_officer_id(request: Request) -> str:
-    """Resolve actor identity using existing development-time mechanism."""
-    officer_id = request.headers.get("x-officer-id", "").strip()
-    return officer_id or "DEV-OFFICER-001"
 
 
 def _build_shareable_link(request: Request, raw_token: str) -> str:
@@ -99,10 +99,12 @@ async def _write_audit_event(
     summary="Create location request (Officer workflow - Phase 2)",
 )
 async def create_request(
-    request: Request,
     payload: LocationRequestCreate,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
 ) -> ApiResponse[LocationRequestResponse]:
     """Create and persist a new officer location request."""
+    require_role(principal, UserRole.OFFICER, UserRole.ADMIN)
+
     if not await _is_operator_active(payload.operator_code):
         raise ValidationException(
             message="Operator is not approved or currently inactive.",
@@ -110,17 +112,8 @@ async def create_request(
             details={"operator_code": payload.operator_code},
         )
 
-    now = datetime.now(timezone.utc)
-    settings = get_settings()
-    raw_share_token = secrets.token_urlsafe(32)
-    share_token_hash = hashlib.sha256(raw_share_token.encode("utf-8")).hexdigest()
-    share_token = ShareTokenInfo(
-        token_hash=share_token_hash,
-        expires_at=now + timedelta(hours=settings.request_token_expire_hours),
-    )
-
     request_id = await _generate_request_id()
-    officer_id = _resolve_submitting_officer_id(request)
+    officer_id = principal.principal_id
 
     document = LocationRequestDocument.create_new(
         request_id=request_id,
@@ -129,7 +122,6 @@ async def create_request(
         operator_code=payload.operator_code,
         submitting_officer_id=officer_id,
         remarks=payload.remarks,
-        share_token=share_token,
     )
 
     await db_manager.location_requests.insert_one(document.model_dump(mode="json"))
@@ -144,13 +136,13 @@ async def create_request(
         },
     )
 
-    response_payload = _to_response(
-        document,
-        shareable_link=_build_shareable_link(request, raw_share_token),
-    )
+    response_payload = _to_response(document)
     return ApiResponse(
         success=True,
-        message="Location request created successfully.",
+        message=(
+            "Location request created successfully. Use the explicit share-link "
+            "endpoint to deliver a one-time bearer link."
+        ),
         data=response_payload,
     )
 
@@ -162,6 +154,7 @@ async def create_request(
     summary="Retrieve request details (Phase 2)",
 )
 async def get_request(
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
     request_id: str = Path(
         ...,
         description="Unique opaque request identifier",
@@ -178,10 +171,80 @@ async def get_request(
 
     data.pop("_id", None)
     document = LocationRequestDocument.model_validate(data)
+    if not can_access_request(principal, document.submitting_officer_id):
+        raise ResourceNotFoundError(message="Location request not found.")
+
     return ApiResponse(
         success=True,
         message="Location request retrieved successfully.",
         data=_to_response(document),
+    )
+
+
+@router.post(
+    "/{request_id}/share-link",
+    response_model=ApiResponse[LocationRequestResponse],
+    status_code=status.HTTP_200_OK,
+    summary="Mint an explicit one-time IO review link",
+)
+async def mint_share_link(
+    request: Request,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+    request_id: str = Path(..., description="Unique opaque request identifier"),
+) -> ApiResponse[LocationRequestResponse]:
+    """Generate and return a raw share link only through an explicit operation."""
+    data = await db_manager.location_requests.find_one({"request_id": request_id})
+    if not data:
+        raise ResourceNotFoundError(message="Location request not found.")
+
+    data.pop("_id", None)
+    document = LocationRequestDocument.model_validate(data)
+    if (
+        principal.role == UserRole.OFFICER
+        and principal.principal_id != document.submitting_officer_id
+    ):
+        raise ResourceNotFoundError(message="Location request not found.")
+    require_role(principal, UserRole.OFFICER, UserRole.ADMIN)
+
+    now = datetime.now(timezone.utc)
+    settings = get_settings()
+    raw_share_token = secrets.token_urlsafe(32)
+    share_token_hash = hashlib.sha256(raw_share_token.encode("utf-8")).hexdigest()
+    share_token = ShareTokenInfo(
+        token_hash=share_token_hash,
+        expires_at=now + timedelta(hours=settings.request_token_expire_hours),
+    )
+
+    update_result = await db_manager.location_requests.update_one(
+        {"request_id": document.request_id},
+        {
+            "$set": {
+                "share_token": share_token.model_dump(mode="json"),
+                "updated_at": now,
+            }
+        },
+    )
+    if update_result.modified_count != 1:
+        raise ResourceNotFoundError(message="Location request not found.")
+
+    refreshed = await db_manager.location_requests.find_one(
+        {"request_id": document.request_id}
+    )
+    if not refreshed:
+        raise ResourceNotFoundError(message="Location request not found.")
+    refreshed.pop("_id", None)
+    refreshed_document = LocationRequestDocument.model_validate(refreshed)
+
+    return ApiResponse(
+        success=True,
+        message=(
+            "Share link minted. The raw bearer token is returned only in this "
+            "explicit response and is not persisted."
+        ),
+        data=_to_response(
+            refreshed_document,
+            shareable_link=_build_shareable_link(request, raw_share_token),
+        ),
     )
 
 

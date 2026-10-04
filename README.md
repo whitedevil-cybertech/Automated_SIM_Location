@@ -12,7 +12,7 @@ Field Officers submit location requests specifying target numbers and carrier pr
 
 ```text
 Phase 1 completed.
-Phase 2 backend completed.
+Phase 2 backend security remediation completed.
 ```
 
 - **Current Version:** `0.1.0` (Phase 1 foundation + Phase 2 backend workflow)
@@ -45,7 +45,7 @@ Automated_SIM_Location/
 │   │   ├── services/       # Base service abstractions
 │   │   ├── routes/         # API routers (health, requests, operators)
 │   │   └── main.py         # FastAPI application entrypoint & lifespan
-│   ├── tests/              # Pytest test suite (17 tests)
+│   ├── tests/              # Pytest test suite
 │   ├── requirements.txt    # Python dependencies
 │   ├── pytest.ini          # Test runner configuration
 │   └── .env.example        # Environment variable template
@@ -112,26 +112,37 @@ Phase 2 (backend scope) now implements officer request management using existing
 1. **Implemented Endpoints:**
    - `POST /api/v1/requests`
    - `GET /api/v1/requests/{request_id}`
+   - `POST /api/v1/requests/{request_id}/share-link`
    - `GET /api/v1/request-links/{token}`
 2. **Request Creation Workflow:**
    - Validates payload via `LocationRequestCreate`.
    - Reuses existing phone validation/normalization and operator-code normalization.
    - Validates operator against approved active profiles.
    - Generates opaque request IDs (`REQ-<high-entropy-hex>`).
-   - Generates secure, expiring tokenized share links.
+   - Requires an authenticated Officer/Admin principal.
+   - Derives `submitting_officer_id` from the authenticated principal.
+   - Stores the normalized target phone only as an encrypted field plus masked/hash derivatives.
+   - Does not return the raw share-link token in the ordinary create response.
    - Persists request and audit events to MongoDB via `DatabaseManager`.
 3. **Secure Request Links:**
+   - Link bearer credential is minted only by explicit `POST /requests/{id}/share-link`.
    - Link bearer credential is a cryptographically secure opaque token.
    - URL excludes phone number, case ID, and request ID.
    - Only token hash is persisted in request documents.
    - Token has expiration and one-time-use replay prevention.
-4. **Audit Events Added:**
+   - Redeeming a link also requires an authenticated IO/Admin principal.
+4. **Authentication & Authorization:**
+   - Phase 2 uses a narrow development-only bearer-token authenticator.
+   - Development static tokens are rejected outside `APP_ENV=development|testing`.
+   - Production/staging must set `AUTH_MODE=external` and integrate an approved identity provider before operational use.
+   - Officers can view/mint links only for their own requests; IO/Admin principals are privileged for request review.
+5. **Audit Events Added:**
    - `REQUEST_CREATED`
    - `SHAREABLE_LINK_ACCESSED`
    - Audit details intentionally exclude raw phone numbers, raw tokens, and location payloads.
-5. **Safety and Privacy:**
+6. **Safety and Privacy:**
    - Request responses always return masked target phone number.
-   - Raw token/hash and database internals are not exposed in API responses.
+   - Raw token delivery is limited to the explicit share-link minting response; token hashes and database internals are never exposed.
 
 ---
 
@@ -178,7 +189,12 @@ MONGODB_URI=mongodb://localhost:27017
 MONGODB_DATABASE=ifso_location_dev
 API_V1_PREFIX=/api/v1
 SECRET_KEY=insecure-dev-key-change-in-production-only-for-local-testing
+AUTH_MODE=development_static
+DEVELOPMENT_AUTH_TOKENS={"dev-officer-token":"OFFICER-DEV-001:OFFICER","dev-io-token":"IO-DEV-001:IO","dev-admin-token":"ADMIN-DEV-001:ADMIN"}
+FIELD_ENCRYPTION_KEY=
 ```
+
+`FIELD_ENCRYPTION_KEY` must be a Fernet key in staging/production. In development/testing, the backend can derive a local-only encryption key from `SECRET_KEY`; do not rely on that derivation for operational data.
 
 #### Running the Backend Server
 ```bash
@@ -199,7 +215,7 @@ The backend test suite verifies startup, OpenAPI schema generation, lifecycle st
 backend\.venv\Scripts\python.exe -m pytest -v backend/tests
 ```
 
-**Results:** `22 passed in ~1.4s`
+**Results:** `26 passed in ~1.3s`
 
 ---
 
@@ -230,11 +246,12 @@ The project strictly follows the forensic, legal, and operational rules defined 
 5. **No Third-Party Scraping:** WhatsApp or third-party messaging apps are never scraped or accessed.
 6. **No Android Policy Bypasses:** The application relies on standard Android enterprise APIs (`SmsManager`) and corporate MDM device-owner policies; it never uses root or security exploits.
 7. **Sensitive Data Masking:** Phone numbers and geographic coordinates are masked in logs and standard UI screens.
+8. **Sensitive Phone Storage:** Normalized target phone numbers are encrypted before MongoDB persistence; standard API responses expose only the masked phone.
 
 ---
 
 ## Known Limitations
 
-1. **Authentication/Authorization:** Production auth is not implemented yet. Phase 2 uses development identity headers (`x-officer-id`, `x-actor-id`) with safe defaults for local/testing flow continuity.
+1. **Authentication/Authorization:** Production auth is not implemented yet. Phase 2 now requires bearer authentication, but the bundled static-token authenticator is development/testing only. Production requires an external identity provider integration before deployment.
 2. **Operator Source in Development:** If operator records are not present in MongoDB, request creation falls back to the existing synthetic approved operator profiles used by `/api/v1/operators`.
 3. **Phase Boundary:** Phase 3/4 behavior (IO execution, Android SMS send/receive, telecom parsing, maps/results processing) remains intentionally out of scope.

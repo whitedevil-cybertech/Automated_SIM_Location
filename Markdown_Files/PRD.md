@@ -13,7 +13,7 @@ This document defines the **IFSO Location Request Management System**, a secure 
 ## Detailed Core Workflow and Main Components
 
 1. **Officer Input:** Multiple field officers use a Flutter app to submit numbers.  They enter the target mobile number, select operator (e.g. JIO/Airtel/VI/BSNL), and include a case reference or remarks.  
-2. **Request Creation:** The backend assigns a request ID (e.g. `LR-2026-00041`), normalizes the number (adding country code), and stores the record with status *PENDING_IO_APPROVAL*.  It returns a tokenized link (e.g. `https://server/req/XYZ123`) that the officer shares to the IO.  
+2. **Request Creation:** The backend assigns a request ID (e.g. `LR-2026-00041`), normalizes the number (adding country code), encrypts the normalized number for storage, and stores the record with status *PENDING_IO_APPROVAL*.  It returns safe request metadata; a tokenized link (e.g. `https://server/req/XYZ123`) is minted only through an explicit share action that the officer uses to notify the IO.  
 3. **IO Notification:** The IO gets notified (via the link or email) and opens the request in their IO app.  The app fetches request details from the backend.  
 4. **IO Authorization:** The IO verifies the information and taps **“Request Location”**.  This action sends a signed HTTPS call to the backend to mark the request as *EXECUTING*.  
 5. **SMS Composition & Send:** The backend responds with operator-specific SMS instructions (prefix, destination number, message template).  The IO app’s native module formats the SMS (e.g. add country code “91” + number) and invokes `SmsManager.sendTextMessage()`.  The SMS appears in the carrier network as coming from the IO’s own phone/SIM.  
@@ -28,7 +28,9 @@ sequenceDiagram
     participant IOApp as IO App
     participant Carrier as Telecom SMS Service
     OfficerApp->>Backend: POST /requests (target, operator)
-    Backend-->>OfficerApp: Request ID + shareable link
+    Backend-->>OfficerApp: Request ID + masked request metadata
+    OfficerApp->>Backend: POST /requests/{id}/share-link
+    Backend-->>OfficerApp: One-time shareable link
     OfficerApp->>IOApp: Share link (e.g. via chat/email)
     IOApp->>Backend: GET /requests/{id}
     Backend-->>IOApp: Request details (pending)
@@ -205,7 +207,8 @@ Endpoints (authentication required on all):
 
 | Endpoint                   | Method | Auth Role   | Request Body / Query                         | Response                                    |
 |----------------------------|--------|-------------|----------------------------------------------|---------------------------------------------|
-| `POST /requests`           | POST   | Officer     | `{target_number, operator, case_id, remarks}`| `{"request_id","share_link"}`               |
+| `POST /requests`           | POST   | Officer     | `{target_number, operator, case_id, remarks}`| `{"request_id","target_masked","status"}`   |
+| `POST /requests/{id}/share-link` | POST | Officer owner/Admin | None | `{"request_id","share_link"}` once |
 | `GET /requests/{id}`       | GET    | IO/Officer? | `id` in URL (tokenized); no body             | `{"target_masked","operator","status",...}` |
 | `POST /requests/{id}/execute` | POST | IO Only    | None (just auth)                             | `{"status":"EXECUTING","sent":true}`        |
 | `POST /requests/{id}/result`  | POST | System (IO) | `{ "sms_text": "...", "sms_from": "..."} `    | `{"status":"COMPLETED","parsed":{...}}`     |
@@ -218,7 +221,7 @@ Endpoints (authentication required on all):
 
 ## Storage and Retention Policy
 
-- **Data at Rest:** MongoDB should use encrypted storage (WiredTiger encryption) if storing sensitive info (target numbers).  
+- **Data at Rest:** MongoDB should use encrypted storage (WiredTiger encryption) where available. The backend must also protect sensitive fields at the application layer when required; current Phase 2 stores target phone numbers as encrypted ciphertext with only masked/hash derivatives in ordinary records and responses.
 - **Retention:** Align with IFSO policy (e.g. retain all logs/requests until case closed + N years). Possibly implement TTL indexes on collections for automated purge after legal retention period.  
 - **Backups:** Regular encrypted backups of the database. Only authorized admin keys should access DB.  
 - **Deletion:** Upon case closure or legal request, specific entries can be redacted (e.g. remove coordinates but keep logs) as per chain-of-custody requirements.
@@ -230,7 +233,7 @@ A lightweight MVP focusing on core functionality (Officer + IO flows, SMS send/r
 | Day  | Tasks                                                    | Deliverables                                                      |
 |------|----------------------------------------------------------|-------------------------------------------------------------------|
 | 1    | Project scaffolding: repo, directories, tech setup (Flutter, FastAPI, Mongo). | Repository with `app/`, stub backend endpoints, basic Flutter app layout. |
-| 2    | Implement `POST /requests` (FastAPI) & Mongo model. Officer UI form to submit a request. | Officer can submit number/operator; backend saves record, returns share-link. |
+| 2    | Implement `POST /requests` (FastAPI) & Mongo model. Officer UI form to submit a request. | Officer can submit number/operator; backend saves protected record and returns safe metadata. |
 | 3    | Tokenized link generation and `GET /requests/{id}`. Link view skeleton. | IO app can open link (or manually enter ID) and see request details (pending). |
 | 4    | IO “Request Location” action. Backend state change to EXECUTING. | IO app button wired; backend updates status; minimal confirmation shown. |
 | 5    | Android SMS send: Flutter->Kotlin bridge. Ask for `SEND_SMS` permission. | IO app sends actual SMS via `SmsManager.sendTextMessage()`. (Test stub number). |
@@ -297,4 +300,3 @@ Future iterations (post-MVP) may include:
 | Legal challenges (evidence admissibility) | Preserve chain-of-custody logs (timestamp, user, status). Clear disclaimers that system is “analysis only, not proof” in report. |
 
 By following these mitigations, we maintain a secure, compliant tool that significantly streamlines location request investigations without introducing undue risk.
-

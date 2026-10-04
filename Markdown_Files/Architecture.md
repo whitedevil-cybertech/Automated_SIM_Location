@@ -64,7 +64,7 @@ flowchart LR
 
 | Component        | Responsibility                                    | Interfaces & Data Flows                   | Failure Modes (Notes)                    |
 |------------------|---------------------------------------------------|-------------------------------------------|------------------------------------------|
-| **Officer App**  | Provide UI to create/share location requests.     |  HTTP POST to `/requests` (JSON containing target number, operator, case, remarks).<br> Displays generated share-link. | – No network: cannot submit request.<br>– Invalid input: backend rejects.<br>– Needs `INTERNET` permission. |
+| **Officer App**  | Provide UI to create/share location requests.     |  HTTP POST to `/requests` with bearer authentication (JSON containing target number, operator, case, remarks).<br> Calls explicit `/requests/{id}/share-link` when a one-time IO review link must be delivered. | – No network: cannot submit request.<br>– Invalid input: backend rejects.<br>– Needs `INTERNET` permission. |
 | **IO App**       | Review pending requests; trigger SMS; capture response. |  HTTP GET `/requests/{id}` to fetch details.<br> HTTP POST `/requests/{id}/execute` to start execution.<br> Receives push updates from Backend (status).<br> Android SMS: Uses `android.telephony.SmsManager.sendTextMessage()` to send SMS; registers BroadcastReceiver for `android.provider.Telephony.SMS_RECEIVED` to capture reply.  | – SMS send fails (no signal, wrong number): should report error to user.<br>– SMS response never arrives: timeout or retry needed.<br>– If app not default SMS, it *can* still receive SMS via non-abortable broadcast. (Only default SMS apps get `SMS_DELIVER_ACTION`.)<br>– Requires `SEND_SMS` and `RECEIVE_SMS` permissions; these are sensitive (see Security section). |
 | **Backend API**  | Core logic, authentication, data validation.      |  Exposes REST API (JSON). Uses HTTPS/TLS (must be configured).<br> Interacts with MongoDB via authenticated driver.<br> JWT/OAuth2 for user auth (supports standard protocols). | – Service offline: requests fail. <br>– Database down: data unavailable.<br>– Bugs: incorrect parsing of operator/number. <br>– Must validate inputs (no injection). |
 | **Database**     | Store requests, operator profiles, audit logs.     |  Persists documents (requests: ID, target, operator, status, timestamps, etc.).<br> Accessed only by Backend. | – Data loss if no backups. <br>– Unencrypted sensitive data if not configured (resolve via encryption).<br>– Performance: many concurrent writes if many requests.  |
@@ -83,7 +83,9 @@ sequenceDiagram
     participant MongoDB
     OfficerApp->>Backend: POST /requests {target, operator, caseID, ...}
     Backend->>MongoDB: insert new request (status=PENDING)
-    Backend-->>OfficerApp: return {request_id, shareable_link}
+    Backend-->>OfficerApp: return {request_id, masked target}
+    OfficerApp->>Backend: POST /requests/{id}/share-link when officer explicitly shares
+    Backend-->>OfficerApp: return one-time bearer link once
 ```
 
 2. **IO executes the location request and handles SMS:**
@@ -95,7 +97,7 @@ sequenceDiagram
     participant MongoDB
     participant SmsManager
     participant Telecom
-    IOApp->>Backend: GET /requests/{id} (via shareable link)
+    IOApp->>Backend: GET /request-links/{token} (authenticated IO review)
     Backend->>MongoDB: fetch request details
     Backend-->>IOApp: return request data (target, operator)
     IOApp->>Backend: POST /requests/{id}/execute
@@ -176,9 +178,9 @@ Use technologies aligned with your skills and project needs:
 
 ## Security & Hardening Checklist
 
-- **Authentication/Authorization:** All API calls must include a valid token. Implement role-based access: Officers can *create* requests; IO can *execute* and view results. Use OAuth2/JWT (FastAPI’s documentation supports this).  
+- **Authentication/Authorization:** All API calls must include a valid bearer token. In the current Phase 2 backend, local static bearer tokens are limited to development/testing and are rejected outside those environments. Production/staging must use an external identity provider. Role-based access is explicit: Officers can create and access their own requests, IO/Admin principals can review requests for the IO workflow, and the share-link redemption endpoint requires IO/Admin authentication.  
 - **Transport Encryption:** Enforce HTTPS/TLS for all communication. Even on internal LAN, use TLS (certificate from enterprise CA). *Never* send sensitive data (target numbers, results) over plaintext. As Google notes, `https://` ensures transport encryption.  
-- **Data Encryption:** Store sensitive fields (mobile number, location) encrypted at rest if possible. MongoDB Enterprise offers on-disk encryption. If not available, encrypt at application level or rely on OS-level disk encryption.  
+- **Data Encryption:** Store sensitive fields encrypted at rest. The Phase 2 backend encrypts normalized target phone numbers at the application layer before MongoDB persistence while retaining a masked value and non-reversible hash for display/lookup. Staging/production must provide an explicit field-encryption key; development/testing may derive a local-only key from `SECRET_KEY`.
 - **Input Validation:** Validate/normalize all input (numbers, operator codes) on the backend to prevent injection or errors. Do **not** trust user-supplied operator codes or formats. Use parameterized queries in DB.  
 - **Android Permissions:**  The IO app requires `<uses-permission android:name="android.permission.SEND_SMS"/>` and `<uses-permission android:name="android.permission.RECEIVE_SMS"/>`. These are **dangerous** permissions. On Android 6.0+, request them at runtime. The app should be marked (in manifest) with `<uses-feature android:name="android.hardware.telephony" android:required="true"/>` so it only installs on SMS-capable devices.  Only the default SMS app can write to the SMS Provider or get SMS_DELIVER_ACTION; our app will listen to the non-abortable `SMS_RECEIVED_ACTION` broadcast to get the operator’s reply.  
 - **API Rate-Limiting:** Implement throttling on critical endpoints (`/execute`) to prevent abuse.  (An attacker or bug could attempt mass queries.)  
@@ -238,7 +240,7 @@ Below is a **flowchart** summarizing the end-to-end workflow:
 flowchart TB
     A[Officer obtains target number] --> B[Officer enters number & selects operator]
     B --> C[Officer App POST /requests → Backend (stores pending)]
-    C --> D[Backend returns shareable link to Officer]
+    C --> D[Officer explicitly mints shareable link]
     D --> E[Officer shares link with IO]
     E --> F[IO opens link in IO App (GET /requests/{id})]
     F --> G[IO reviews details, taps "Request Location"]

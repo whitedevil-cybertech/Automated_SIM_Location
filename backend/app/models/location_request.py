@@ -9,6 +9,7 @@ import hashlib
 from typing import Any, Dict, Optional
 from pydantic import BaseModel, Field
 
+from backend.app.core.field_crypto import decrypt_phone_number, encrypt_phone_number
 from backend.app.core.logging import mask_phone_number
 from backend.app.models.enums import RequestState
 
@@ -89,8 +90,8 @@ class LocationRequestDocument(BaseModel):
 
     request_id: str = Field(description="Unique opaque ID, e.g. REQ-2026-XXXXX")
     case_id: str = Field(description="Case reference / FIR number")
-    target_phone_number: str = Field(
-        description="Normalized target number (e.g., +919876543210). Sensitive field."
+    target_phone_encrypted: str = Field(
+        description="Encrypted normalized target number for authorized backend use."
     )
     target_phone_masked: str = Field(
         description="Pre-masked number for UI display (e.g., +91 XXXXXXX210)"
@@ -149,15 +150,16 @@ class LocationRequestDocument(BaseModel):
         share_token: Optional[ShareTokenInfo] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> "LocationRequestDocument":
-        """Factory constructor ensuring proper masking and hashing of phone numbers."""
-        masked = mask_phone_number(target_phone_number)
-        hashed = hashlib.sha256(target_phone_number.strip().encode("utf-8")).hexdigest()
+        """Factory constructor ensuring masking, hashing, and encryption."""
+        normalized_phone = target_phone_number.strip()
+        masked = mask_phone_number(normalized_phone)
+        hashed = hashlib.sha256(normalized_phone.encode("utf-8")).hexdigest()
         now = datetime.now(timezone.utc)
 
         return cls(
             request_id=request_id,
             case_id=case_id,
-            target_phone_number=target_phone_number.strip(),
+            target_phone_encrypted=encrypt_phone_number(normalized_phone),
             target_phone_masked=masked,
             target_phone_hash=hashed,
             operator_code=operator_code.upper().strip(),
@@ -169,3 +171,7 @@ class LocationRequestDocument(BaseModel):
             share_token=share_token,
             metadata=metadata or {},
         )
+
+    def decrypt_target_phone_number(self) -> str:
+        """Recover the normalized target number for authorized backend workflows."""
+        return decrypt_phone_number(self.target_phone_encrypted)
