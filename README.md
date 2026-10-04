@@ -12,11 +12,11 @@ Field Officers submit location requests specifying target numbers and carrier pr
 
 ```text
 Phase 1 completed.
-Phase 2 not yet implemented.
+Phase 2 backend completed.
 ```
 
-- **Current Version:** `0.1.0` (Phase 1 — Foundation & Architecture)
-- **Next Target:** Phase 2 — Officer Request Management (Request creation forms, server-side storage, tokenized single-use links).
+- **Current Version:** `0.1.0` (Phase 1 foundation + Phase 2 backend workflow)
+- **Next Target:** Phase 3 — IO Execution & Android SMS Bridge.
 
 ---
 
@@ -105,6 +105,36 @@ Phase 1 established the clean, secure, and maintainable foundation for the syste
 
 ---
 
+## Phase 2 Backend Implementation Summary
+
+Phase 2 (backend scope) now implements officer request management using existing Phase 1 architecture:
+
+1. **Implemented Endpoints:**
+   - `POST /api/v1/requests`
+   - `GET /api/v1/requests/{request_id}`
+   - `GET /api/v1/request-links/{token}`
+2. **Request Creation Workflow:**
+   - Validates payload via `LocationRequestCreate`.
+   - Reuses existing phone validation/normalization and operator-code normalization.
+   - Validates operator against approved active profiles.
+   - Generates opaque request IDs (`REQ-<high-entropy-hex>`).
+   - Generates secure, expiring tokenized share links.
+   - Persists request and audit events to MongoDB via `DatabaseManager`.
+3. **Secure Request Links:**
+   - Link bearer credential is a cryptographically secure opaque token.
+   - URL excludes phone number, case ID, and request ID.
+   - Only token hash is persisted in request documents.
+   - Token has expiration and one-time-use replay prevention.
+4. **Audit Events Added:**
+   - `REQUEST_CREATED`
+   - `SHAREABLE_LINK_ACCESSED`
+   - Audit details intentionally exclude raw phone numbers, raw tokens, and location payloads.
+5. **Safety and Privacy:**
+   - Request responses always return masked target phone number.
+   - Raw token/hash and database internals are not exposed in API responses.
+
+---
+
 ## Setup & Development Guide
 
 ### 1. Backend Setup
@@ -162,14 +192,14 @@ uvicorn backend.app.main:app --reload --host 0.0.0.0 --port 8000
 
 ### 2. Running Backend Tests
 
-The backend test suite verifies application startup, OpenAPI schema generation, lifecycle state transitions, Pydantic schema validation, phone masking, logging redaction, and database offline resilience:
+The backend test suite verifies startup, OpenAPI schema generation, lifecycle state transitions, request validation, request persistence workflows, secure token-link behavior, replay/expiry handling, masking/redaction, and database offline resilience:
 
 ```bash
 # From repository root
 backend\.venv\Scripts\python.exe -m pytest -v backend/tests
 ```
 
-**Results:** `17 passed in ~1.1s`
+**Results:** `22 passed in ~1.4s`
 
 ---
 
@@ -200,3 +230,11 @@ The project strictly follows the forensic, legal, and operational rules defined 
 5. **No Third-Party Scraping:** WhatsApp or third-party messaging apps are never scraped or accessed.
 6. **No Android Policy Bypasses:** The application relies on standard Android enterprise APIs (`SmsManager`) and corporate MDM device-owner policies; it never uses root or security exploits.
 7. **Sensitive Data Masking:** Phone numbers and geographic coordinates are masked in logs and standard UI screens.
+
+---
+
+## Known Limitations
+
+1. **Authentication/Authorization:** Production auth is not implemented yet. Phase 2 uses development identity headers (`x-officer-id`, `x-actor-id`) with safe defaults for local/testing flow continuity.
+2. **Operator Source in Development:** If operator records are not present in MongoDB, request creation falls back to the existing synthetic approved operator profiles used by `/api/v1/operators`.
+3. **Phase Boundary:** Phase 3/4 behavior (IO execution, Android SMS send/receive, telecom parsing, maps/results processing) remains intentionally out of scope.
