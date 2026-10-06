@@ -82,6 +82,28 @@ def fake_database(monkeypatch: pytest.MonkeyPatch) -> FakeDatabase:
     return fake_db
 
 
+async def _create_pending_request(async_client, fake_database: FakeDatabase) -> str:
+    await fake_database.operators.insert_one({"operator_code": "JIO", "is_active": True})
+    create_response = await async_client.post(
+        "/api/v1/requests",
+        json={
+            "case_id": "FIR-2026-EXEC-1",
+            "target_phone_number": "9876543210",
+            "operator_code": "JIO",
+        },
+        headers=OFFICER_AUTH,
+    )
+    request_id = create_response.json()["data"]["request_id"]
+    mint_response = await async_client.post(
+        f"/api/v1/requests/{request_id}/share-link",
+        headers=OFFICER_AUTH,
+    )
+    token = mint_response.json()["data"]["shareable_link"].rsplit("/", 1)[-1]
+    access_response = await async_client.get(f"/api/v1/request-links/{token}", headers=IO_AUTH)
+    assert access_response.status_code == 200
+    return request_id
+
+
 @pytest.mark.asyncio
 async def test_create_request_success_and_persistence(async_client, fake_database: FakeDatabase):
     await fake_database.operators.insert_one({"operator_code": "JIO", "is_active": True})
@@ -353,3 +375,88 @@ async def test_share_link_requires_io_auth(async_client, fake_database: FakeData
         f"/api/v1/request-links/{token}", headers=OFFICER_AUTH
     )
     assert officer_auth.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_execute_request_success_persists_metadata_and_audit(
+    async_client, fake_database: FakeDatabase
+):
+    request_id = await _create_pending_request(async_client, fake_database)
+
+    execute_response = await async_client.post(
+        f"/api/v1/requests/{request_id}/execute",
+        json={"io_device_id": "MDM-DEVICE-01", "sim_slot_index": 1},
+        headers=IO_AUTH,
+    )
+    assert execute_response.status_code == 200
+    payload = execute_response.json()
+    assert payload["success"] is True
+    assert payload["data"]["status"] == "EXECUTING"
+    assert payload["data"]["executing_io_id"] == "IO-DEV-001"
+    assert payload["data"]["io_device_id"] == "MDM-DEVICE-01"
+    assert payload["data"]["sim_slot_index"] == 1
+
+    stored = next(
+        doc
+        for doc in fake_database.location_requests.documents
+        if doc["request_id"] == request_id
+    )
+    assert stored["status"] == "EXECUTING"
+    assert stored["executing_io_id"] == "IO-DEV-001"
+    assert stored["execution_info"]["io_device_id"] == "MDM-DEVICE-01"
+    assert stored["execution_info"]["sim_slot_index"] == 1
+    assert stored["execution_info"]["dispatched_at"] is not None
+
+    assert any(
+        audit["event_type"] == "EXECUTION_TRIGGERED"
+        and audit["request_id"] == request_id
+        and audit["actor_id"] == "IO-DEV-001"
+        for audit in fake_database.audit_logs.documents
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_request_denies_officer(async_client, fake_database: FakeDatabase):
+    request_id = await _create_pending_request(async_client, fake_database)
+    response = await async_client.post(
+        f"/api/v1/requests/{request_id}/execute",
+        json={"io_device_id": "MDM-DEVICE-02", "sim_slot_index": 0},
+        headers=OFFICER_AUTH,
+    )
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "FORBIDDEN"
+
+
+@pytest.mark.asyncio
+async def test_execute_request_denies_unauthenticated(async_client, fake_database: FakeDatabase):
+    request_id = await _create_pending_request(async_client, fake_database)
+    response = await async_client.post(
+        f"/api/v1/requests/{request_id}/execute",
+        json={"io_device_id": "MDM-DEVICE-03", "sim_slot_index": 0},
+    )
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "UNAUTHORIZED"
+
+
+@pytest.mark.asyncio
+async def test_execute_request_rejects_wrong_state(async_client, fake_database: FakeDatabase):
+    await fake_database.operators.insert_one({"operator_code": "JIO", "is_active": True})
+    create_response = await async_client.post(
+        "/api/v1/requests",
+        json={
+            "case_id": "FIR-2026-EXEC-2",
+            "target_phone_number": "9876543210",
+            "operator_code": "JIO",
+        },
+        headers=OFFICER_AUTH,
+    )
+    request_id = create_response.json()["data"]["request_id"]
+
+    execute_response = await async_client.post(
+        f"/api/v1/requests/{request_id}/execute",
+        json={"io_device_id": "MDM-DEVICE-04", "sim_slot_index": 0},
+        headers=IO_AUTH,
+    )
+    assert execute_response.status_code == 409
+    payload = execute_response.json()
+    assert payload["error"]["code"] == "INVALID_STATE_TRANSITION"

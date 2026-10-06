@@ -13,10 +13,11 @@ Field Officers submit location requests specifying target numbers and carrier pr
 ```text
 Phase 1 completed.
 Phase 2 backend security remediation completed.
+Phase 3A IO execution authorization completed.
 ```
 
-- **Current Version:** `0.1.0` (Phase 1 foundation + Phase 2 backend workflow)
-- **Next Target:** Phase 3 — IO Execution & Android SMS Bridge.
+- **Current Version:** `0.1.0` (Phase 1 foundation + Phase 2 backend workflow + Phase 3A backend IO authorization)
+- **Next Target:** Phase 3B/3C — Android SMS bridge dispatch and response ingestion/parsing.
 
 ---
 
@@ -215,7 +216,7 @@ The backend test suite verifies startup, OpenAPI schema generation, lifecycle st
 backend\.venv\Scripts\python.exe -m pytest -v backend/tests
 ```
 
-**Results:** `26 passed in ~1.3s`
+**Latest Results (Phase 3A):** `python -m pytest -q backend/tests` → `30 passed, 2 warnings in 1.32s`
 
 ---
 
@@ -254,4 +255,4 @@ The project strictly follows the forensic, legal, and operational rules defined 
 
 1. **Authentication/Authorization:** Production auth is not implemented yet. Phase 2 now requires bearer authentication, but the bundled static-token authenticator is development/testing only. Production requires an external identity provider integration before deployment.
 2. **Operator Source in Development:** If operator records are not present in MongoDB, request creation falls back to the existing synthetic approved operator profiles used by `/api/v1/operators`.
-3. **Phase Boundary:** Phase 3/4 behavior (IO execution, Android SMS send/receive, telecom parsing, maps/results processing) remains intentionally out of scope.
+3. **Phase Boundary:** Phase 3A backend authorization is implemented; Phase 3B/3C Android SMS bridge dispatch and response processing remain out of scope.

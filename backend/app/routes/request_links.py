@@ -12,7 +12,7 @@ from backend.app.core.auth import (
 from backend.app.core.database import db_manager
 from backend.app.core.exceptions import ResourceNotFoundError
 from backend.app.models.audit_log import AuditLogDocument
-from backend.app.models.enums import AuditEventType, UserRole
+from backend.app.models.enums import AuditEventType, RequestState, UserRole
 from backend.app.models.location_request import LocationRequestDocument
 from backend.app.schemas.common import ApiResponse
 from backend.app.schemas.location_request import LocationRequestResponse
@@ -81,6 +81,11 @@ async def access_request_link(
                 "share_token.is_used": True,
                 "share_token.used_at": now,
                 "updated_at": now,
+                **(
+                    {"status": RequestState.PENDING_IO_REVIEW.value}
+                    if document.status == RequestState.CREATED
+                    else {}
+                ),
             }
         },
     )
@@ -95,6 +100,18 @@ async def access_request_link(
         details={"access_method": "token_link"},
     )
     await db_manager.audit_logs.insert_one(event.model_dump(mode="json"))
+    if document.status == RequestState.CREATED:
+        io_review_event = AuditLogDocument(
+            request_id=document.request_id,
+            actor_id=principal.principal_id,
+            actor_role=principal.role,
+            event_type=AuditEventType.IO_REVIEW_STARTED,
+            details={
+                "previous_status": RequestState.CREATED.value,
+                "status": RequestState.PENDING_IO_REVIEW.value,
+            },
+        )
+        await db_manager.audit_logs.insert_one(io_review_event.model_dump(mode="json"))
 
     refreshed = await db_manager.location_requests.find_one(
         {"request_id": document.request_id}

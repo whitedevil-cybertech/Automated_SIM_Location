@@ -43,10 +43,10 @@ async def test_openapi_schema_generation(async_client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_phase3_request_endpoint_still_stubbed(async_client: AsyncClient):
-    """Verify Phase 3 endpoint remains intentionally stubbed."""
+async def test_phase3_execute_endpoint_requires_authentication(async_client: AsyncClient):
+    """Verify execute endpoint now enforces authentication."""
     response = await async_client.post("/api/v1/requests/REQ-TEST-001/execute", json={})
-    assert response.status_code == 501
+    assert response.status_code == 401
     error_body = response.json()
     assert error_body["success"] is False
-    assert error_body["error"]["code"] == "NOT_IMPLEMENTED"
+    assert error_body["error"]["code"] == "UNAUTHORIZED"

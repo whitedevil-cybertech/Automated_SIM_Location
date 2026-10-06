@@ -14,9 +14,18 @@ from backend.app.core.auth import (
 )
 from backend.app.core.config import get_settings
 from backend.app.core.database import db_manager
-from backend.app.core.exceptions import ResourceNotFoundError, ValidationException
+from backend.app.core.exceptions import (
+    InvalidStateTransitionError,
+    ResourceNotFoundError,
+    ValidationException,
+)
 from backend.app.models.audit_log import AuditLogDocument
-from backend.app.models.enums import AuditEventType, UserRole
+from backend.app.models.enums import (
+    AuditEventType,
+    RequestState,
+    UserRole,
+    is_valid_transition,
+)
 from backend.app.models.location_request import LocationRequestDocument, ShareTokenInfo
 from backend.app.routes.operators import DEMO_OPERATORS
 from backend.app.schemas.common import ApiResponse
@@ -251,17 +260,90 @@ async def mint_share_link(
 @router.post(
     "/{request_id}/execute",
     response_model=ApiResponse[dict],
-    status_code=status.HTTP_501_NOT_IMPLEMENTED,
+    status_code=status.HTTP_200_OK,
     summary="Authorize and trigger IO SMS dispatch (Phase 3)",
 )
 async def execute_request(
     payload: LocationExecuteRequest,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
     request_id: str = Path(..., description="Unique request identifier"),
 ) -> ApiResponse[dict]:
-    """Endpoint convention for IO authorization and SMS dispatch initiation."""
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="IO SMS execution workflow is scheduled for Phase 3.",
+    """Authorize IO execution and persist Android-side dispatch metadata."""
+    require_role(principal, UserRole.IO, UserRole.ADMIN)
+
+    data = await db_manager.location_requests.find_one({"request_id": request_id})
+    if not data:
+        raise ResourceNotFoundError(message="Location request not found.")
+
+    data.pop("_id", None)
+    document = LocationRequestDocument.model_validate(data)
+
+    if not await _is_operator_active(document.operator_code):
+        raise ValidationException(
+            message="Operator is not approved or currently inactive.",
+            field="operator_code",
+            details={"operator_code": document.operator_code},
+        )
+
+    if not is_valid_transition(document.status, RequestState.EXECUTING):
+        raise InvalidStateTransitionError(
+            current_state=document.status.value,
+            target_state=RequestState.EXECUTING.value,
+        )
+
+    now = datetime.now(timezone.utc)
+    update_result = await db_manager.location_requests.update_one(
+        {"request_id": request_id, "status": document.status.value},
+        {
+            "$set": {
+                "status": RequestState.EXECUTING.value,
+                "executing_io_id": principal.principal_id,
+                "execution_info.io_device_id": payload.io_device_id,
+                "execution_info.sim_slot_index": payload.sim_slot_index,
+                "execution_info.dispatched_at": now,
+                "updated_at": now,
+            }
+        },
+    )
+    if update_result.modified_count != 1:
+        latest = await db_manager.location_requests.find_one({"request_id": request_id})
+        if not latest:
+            raise ResourceNotFoundError(message="Location request not found.")
+        latest_status = latest.get("status", "UNKNOWN")
+        raise InvalidStateTransitionError(
+            current_state=str(latest_status),
+            target_state=RequestState.EXECUTING.value,
+            message="Request state changed before execution could be triggered.",
+        )
+
+    await _write_audit_event(
+        request_id=request_id,
+        actor_id=principal.principal_id,
+        actor_role=principal.role,
+        event_type=AuditEventType.EXECUTION_TRIGGERED,
+        details={
+            "previous_status": document.status.value,
+            "status": RequestState.EXECUTING.value,
+            "io_device_id": payload.io_device_id,
+            "sim_slot_index": payload.sim_slot_index,
+            "execution_boundary": "android_device",
+        },
+    )
+
+    return ApiResponse(
+        success=True,
+        message=(
+            "Execution authorized and recorded. Backend did not dispatch SMS; "
+            "Android device execution boundary remains enforced."
+        ),
+        data={
+            "request_id": request_id,
+            "status": RequestState.EXECUTING.value,
+            "executing_io_id": principal.principal_id,
+            "io_device_id": payload.io_device_id,
+            "sim_slot_index": payload.sim_slot_index,
+            "dispatched_at": now,
+        },
     )
 
 
