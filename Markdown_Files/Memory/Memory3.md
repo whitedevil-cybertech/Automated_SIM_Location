@@ -54,3 +54,57 @@ Warnings:
 2. Implement `/requests/{request_id}/result` ingestion pipeline.
 3. Store raw response chain-of-custody metadata and parser outputs using existing models.
 4. Add lifecycle/audit tests for response receipt, parse outcomes, timeout/failure branches, and terminal states.
+---
+
+# Phase 3B — Flutter IO Review + Execution API Integration
+
+## Implementation Status
+
+Phase 3B is completed.
+
+The Flutter mobile application now provides the IO Review execution boundary defined by the Phase 3A backend contract.
+
+## Files Changed
+
+### Flutter application
+
+- `mobile_app/pubspec.yaml`
+  - Added `http` dependency for minimal HTTP API integration.
+
+- `mobile_app/lib/models/location_request.dart`
+  - Added `LocationRequest` model based on the existing backend `LocationRequestResponse` contract.
+  - Preserves masked target phone representation.
+  - Maps backend lifecycle status to the existing Flutter `RequestState` enum.
+
+- `mobile_app/lib/services/api_service.dart`
+  - Added minimal HTTP client integration.
+  - Implements `POST /api/v1/requests/{request_id}/execute`.
+  - Sends the existing `LocationExecuteRequest` payload:
+    - `io_device_id`
+    - `sim_slot_index`
+  - Reuses bearer authentication through injected `authToken`.
+  - Parses the existing backend `ApiResponse` / `ErrorResponse` semantics.
+  - Handles network and timeout failures without exposing sensitive request data.
+
+- `mobile_app/lib/screens/io_review_screen.dart`
+  - Added IO Review UI.
+  - Displays request ID, masked target number, operator, lifecycle state, case ID, creation timestamp, remarks, IO device, and SIM slot.
+  - Requires explicit execution confirmation.
+  - Provides loading, success, and safe error states.
+  - Prevents duplicate execution while an execution request is in progress.
+  - Explicitly communicates that backend authorization does not mean backend SMS transmission.
+
+- `mobile_app/test/api_service_test.dart`
+  - Added API integration tests for success and backend/network error semantics.
+
+- `mobile_app/test/io_review_screen_test.dart`
+  - Added Flutter widget tests for IO Review execution behavior.
+
+- `mobile_app/lib/core/theme/app_theme.dart`
+  - Updated `CardTheme` to `CardThemeData` for Flutter 3.47 compatibility.
+  - No functional Phase 3B behavior was changed by this compatibility update.
+
+## API Endpoint Used
+
+```text
+POST /api/v1/requests/{request_id}/execute

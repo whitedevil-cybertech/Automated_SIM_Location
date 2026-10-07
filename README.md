@@ -14,10 +14,11 @@ Field Officers submit location requests specifying target numbers and carrier pr
 Phase 1 completed.
 Phase 2 backend security remediation completed.
 Phase 3A IO execution authorization completed.
+Phase 3B Flutter IO Review + execution API integration completed.
 ```
 
-- **Current Version:** `0.1.0` (Phase 1 foundation + Phase 2 backend workflow + Phase 3A backend IO authorization)
-- **Next Target:** Phase 3B/3C — Android SMS bridge dispatch and response ingestion/parsing.
+**Current Version:** `0.1.0` (Phase 1 foundation + Phase 2 backend workflow + Phase 3A backend IO authorization + Phase 3B Flutter IO Review)
+**Next Target:** Phase 3C — Android telephony/SMS execution bridge.
 
 ---
 
@@ -255,4 +256,4 @@ The project strictly follows the forensic, legal, and operational rules defined 
 
 1. **Authentication/Authorization:** Production auth is not implemented yet. Phase 2 now requires bearer authentication, but the bundled static-token authenticator is development/testing only. Production requires an external identity provider integration before deployment.
 2. **Operator Source in Development:** If operator records are not present in MongoDB, request creation falls back to the existing synthetic approved operator profiles used by `/api/v1/operators`.
-3. **Phase Boundary:** Phase 3A backend authorization is implemented; Phase 3B/3C Android SMS bridge dispatch and response processing remain out of scope.
+3. **Phase Boundary:** Phase 3A backend authorization and Phase 3B Flutter IO Review/API integration are implemented. Android SMS dispatch, SIM discovery, Kotlin `SmsManager`, and response ingestion remain Phase 3C/Phase 4 work.

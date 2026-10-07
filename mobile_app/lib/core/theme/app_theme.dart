@@ -31,7 +31,7 @@ abstract class AppTheme {
       ),
 
       // Card styling per Design.md
-      cardTheme: const CardTheme(
+      cardTheme: const CardThemeData(
         color: AppColors.surfaceContainer,
         elevation: 0,
         shape: RoundedRectangleBorder(
