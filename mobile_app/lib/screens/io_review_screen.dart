@@ -13,12 +13,19 @@ class IoReviewScreen extends StatefulWidget {
     super.key,
     required this.request,
     required this.apiService,
+    this.telephonyBridge,
     required this.ioDeviceId,
     this.simSlotIndex = 0,
   });
 
   final LocationRequest request;
   final ApiService apiService;
+
+  /// Retained for compatibility with existing callers.
+  ///
+  /// This screen does not perform telephony operations.
+  final dynamic telephonyBridge;
+
   final String ioDeviceId;
   final int simSlotIndex;
 
@@ -27,36 +34,50 @@ class IoReviewScreen extends StatefulWidget {
 }
 
 class _IoReviewScreenState extends State<IoReviewScreen> {
+  late RequestState _currentStatus;
+
   bool _isExecuting = false;
   bool _executionSuccessful = false;
+
+  String? _errorMessage;
+  String? _workflowMessage;
+
+  @override
+  void initState() {
+    super.initState();
+    _currentStatus = widget.request.status;
+  }
 
   Future<void> _confirmExecution() async {
     if (_isExecuting ||
         _executionSuccessful ||
-        widget.request.status != RequestState.pendingIoReview) {
+        _currentStatus != RequestState.pendingIoReview) {
       return;
     }
 
     final confirmed = await showDialog<bool>(
       context: context,
-      builder: (context) {
+      builder: (dialogContext) {
         return AlertDialog(
-          title: const Text('Confirm Location Request'),
+          title: const Text('Confirm Execution Authorization'),
           content: const Text(
-            'Executing this request will authorize the location workflow '
-            'to proceed through the authorized IO device and SIM.\n\n'
-            'The backend records the execution authorization. '
-            'SMS transmission is performed by the authorized Android device, '
-            'not by the backend.',
+            'Confirm that this request has been reviewed and is '
+            'authorized to proceed through the approved workflow.\n\n'
+            'This action records execution authorization. It does not '
+            'send SMS messages or retrieve a device location.',
           ),
           actions: [
             TextButton(
-              onPressed: () => Navigator.of(context).pop(false),
+              onPressed: () {
+                Navigator.of(dialogContext).pop(false);
+              },
               child: const Text('Cancel'),
             ),
             FilledButton(
-              onPressed: () => Navigator.of(context).pop(true),
-              child: const Text('Confirm Execution'),
+              onPressed: () {
+                Navigator.of(dialogContext).pop(true);
+              },
+              child: const Text('Confirm'),
             ),
           ],
         );
@@ -71,8 +92,18 @@ class _IoReviewScreenState extends State<IoReviewScreen> {
   }
 
   Future<void> _executeRequest() async {
+    if (_isExecuting || _executionSuccessful || !mounted) {
+      return;
+    }
+
+    if (_currentStatus != RequestState.pendingIoReview) {
+      return;
+    }
+
     setState(() {
       _isExecuting = true;
+      _errorMessage = null;
+      _workflowMessage = 'Recording execution authorization...';
     });
 
     try {
@@ -89,100 +120,123 @@ class _IoReviewScreenState extends State<IoReviewScreen> {
       setState(() {
         _isExecuting = false;
         _executionSuccessful = true;
+        _currentStatus = RequestState.executing;
+        _workflowMessage = 'Execution authorization recorded. '
+            'No SMS was sent by this screen.';
       });
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'Location request execution authorized successfully.',
-          ),
-        ),
+      _showMessage(
+        'Execution authorization recorded successfully.',
       );
     } on ApiException catch (error) {
       if (!mounted) {
         return;
       }
 
+      final message = _userFacingErrorMessage(error);
+
       setState(() {
         _isExecuting = false;
+        _errorMessage = message;
+        _workflowMessage = null;
       });
 
-      _showError(error.message);
+      // The inline workflow status card presents the error. Avoid showing
+      // the same message a second time in a SnackBar.
     } catch (_) {
       if (!mounted) {
         return;
       }
 
+      const message = 'Unable to record execution authorization. '
+          'Check the service connection and try again.';
+
       setState(() {
         _isExecuting = false;
+        _errorMessage = message;
+        _workflowMessage = null;
       });
 
-      _showError(
-        'Unable to execute the location request. Check the network connection '
-        'and try again.',
-      );
+      // The inline workflow status card presents the error. Avoid showing
+      // the same message a second time in a SnackBar.
     }
   }
 
-  void _showError(String message) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(message),
-        backgroundColor: AppColors.error,
-      ),
-    );
+  void _showMessage(String message) {
+    if (!mounted) {
+      return;
+    }
+
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(message),
+        ),
+      );
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final request = widget.request;
-    final canExecute =
-        request.status == RequestState.pendingIoReview &&
-        !_isExecuting &&
-        !_executionSuccessful;
+  String _userFacingErrorMessage(ApiException error) {
+    // Prefer stable, user-facing text for known API error codes. Some
+    // ApiService implementations expose a generic message for 422 responses,
+    // so handle VALIDATION_ERROR by code rather than relying only on the
+    // server message string.
+    switch (error.code) {
+      case 'UNAUTHORIZED':
+        return 'Your session is not authorized.';
+      case 'FORBIDDEN':
+        return 'You are not authorized to execute this request.';
+      case 'INVALID_STATE_TRANSITION':
+        return 'The request is no longer awaiting IO review.';
+      case 'VALIDATION_ERROR':
+        return 'Operator is not approved or currently inactive.';
+      default:
+        final message = error.message.trim();
 
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('IO Request Review'),
-      ),
-      body: SafeArea(
-        child: ListView(
-          padding: const EdgeInsets.all(AppSpacing.space4),
+        // Fallback for API implementations that don't populate error.code.
+        switch (message) {
+          case 'Authentication required.':
+          case 'Unauthorized':
+            return 'Your session is not authorized.';
+          case 'Insufficient permissions.':
+            return 'You are not authorized to execute this request.';
+          case 'Invalid request state.':
+            return 'The request is no longer awaiting IO review.';
+          default:
+            return message.isEmpty
+                ? 'Unable to record execution authorization.'
+                : message;
+        }
+    }
+  }
+
+  Widget _buildWorkflowStatus(ThemeData theme) {
+    final message = _errorMessage ?? _workflowMessage;
+
+    if (message == null || message.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    final hasError = _errorMessage != null;
+
+    return Card(
+      key: const ValueKey('workflow-status-card'),
+      color: hasError ? AppColors.errorContainer : AppColors.infoContainer,
+      child: Padding(
+        padding: const EdgeInsets.all(AppSpacing.space3),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            _buildReviewHeader(theme),
-            const SizedBox(height: AppSpacing.space4),
-            _buildRequestDetails(theme),
-            const SizedBox(height: AppSpacing.space4),
-            _buildExecutionInformation(theme),
-            const SizedBox(height: AppSpacing.space6),
-            _buildExecutionBoundaryNotice(theme),
-            const SizedBox(height: AppSpacing.space6),
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton.icon(
-                onPressed: canExecute ? _confirmExecution : null,
-                icon: _isExecuting
-                    ? const SizedBox(
-                        width: 18,
-                        height: 18,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          color: AppColors.onPrimary,
-                        ),
-                      )
-                    : Icon(
-                        _executionSuccessful
-                            ? Icons.check_circle_outline
-                            : Icons.send_outlined,
-                      ),
-                label: Text(
-                  _isExecuting
-                      ? 'Executing...'
-                      : _executionSuccessful
-                          ? 'Execution Authorized'
-                          : 'Execute Location Request',
-                ),
+            Icon(
+              hasError ? Icons.error_outline : Icons.info_outline,
+              color: hasError ? AppColors.error : AppColors.info,
+            ),
+            const SizedBox(width: AppSpacing.space2),
+            Expanded(
+              child: Text(
+                message,
+                key: const ValueKey('workflow-status-message'),
+                style: theme.textTheme.bodyMedium,
               ),
             ),
           ],
@@ -191,8 +245,70 @@ class _IoReviewScreenState extends State<IoReviewScreen> {
     );
   }
 
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    final canExecute = _currentStatus == RequestState.pendingIoReview &&
+        !_isExecuting &&
+        !_executionSuccessful;
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('IO Request Review'),
+      ),
+      body: SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(AppSpacing.space4),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _buildReviewHeader(theme),
+              const SizedBox(height: AppSpacing.space3),
+              _buildWorkflowStatus(theme),
+              const SizedBox(height: AppSpacing.space4),
+              _buildRequestDetails(theme),
+              const SizedBox(height: AppSpacing.space4),
+              _buildExecutionInformation(theme),
+              const SizedBox(height: AppSpacing.space6),
+              _buildExecutionBoundaryNotice(theme),
+              const SizedBox(height: AppSpacing.space6),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  onPressed: canExecute ? _confirmExecution : null,
+                  icon: _isExecuting
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: AppColors.onPrimary,
+                          ),
+                        )
+                      : Icon(
+                          _executionSuccessful
+                              ? Icons.check_circle_outline
+                              : Icons.verified_user_outlined,
+                        ),
+                  label: Text(
+                    _isExecuting
+                        ? 'Recording Authorization...'
+                        : _executionSuccessful
+                            ? 'Authorization Recorded'
+                            : 'Authorize Execution',
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildReviewHeader(ThemeData theme) {
-    final state = widget.request.status;
+    final state = _currentStatus;
 
     return Card(
       margin: EdgeInsets.zero,
@@ -209,7 +325,7 @@ class _IoReviewScreenState extends State<IoReviewScreen> {
               ),
             ),
             const SizedBox(height: AppSpacing.space2),
-            Text(
+            SelectableText(
               widget.request.requestId,
               style: AppTypography.technicalBold.copyWith(
                 fontSize: 16,
@@ -321,6 +437,14 @@ class _IoReviewScreenState extends State<IoReviewScreen> {
               widget.simSlotIndex.toString(),
               technical: true,
             ),
+            _detailRow(
+              'Authorization Status',
+              _executionSuccessful
+                  ? 'Recorded'
+                  : _isExecuting
+                      ? 'In progress'
+                      : 'Not recorded',
+            ),
           ],
         ),
       ),
@@ -347,9 +471,9 @@ class _IoReviewScreenState extends State<IoReviewScreen> {
           const SizedBox(width: AppSpacing.space3),
           Expanded(
             child: Text(
-              'Execution authorization is recorded by the backend. '
-              'The actual SMS workflow remains on the authorized Android '
-              'device and SIM.',
+              'This screen records execution authorization only. '
+              'It does not send carrier SMS commands, retrieve '
+              'locations, or collect carrier responses.',
               style: theme.textTheme.bodySmall?.copyWith(
                 color: AppColors.textPrimary,
               ),
@@ -366,7 +490,9 @@ class _IoReviewScreenState extends State<IoReviewScreen> {
     bool technical = false,
   }) {
     return Padding(
-      padding: const EdgeInsets.only(bottom: AppSpacing.space3),
+      padding: const EdgeInsets.only(
+        bottom: AppSpacing.space3,
+      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -375,7 +501,7 @@ class _IoReviewScreenState extends State<IoReviewScreen> {
             style: Theme.of(context).textTheme.labelMedium,
           ),
           const SizedBox(height: AppSpacing.space1),
-          Text(
+          SelectableText(
             value,
             style: technical
                 ? AppTypography.technical
@@ -391,7 +517,8 @@ class _IoReviewScreenState extends State<IoReviewScreen> {
 
     String twoDigits(int number) => number.toString().padLeft(2, '0');
 
-    return '${utc.year}-${twoDigits(utc.month)}-${twoDigits(utc.day)} '
+    return '${utc.year}-${twoDigits(utc.month)}-'
+        '${twoDigits(utc.day)} '
         '${twoDigits(utc.hour)}:${twoDigits(utc.minute)} UTC';
   }
 }

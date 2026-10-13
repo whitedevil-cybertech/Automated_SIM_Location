@@ -110,6 +110,40 @@ class LocationExecuteRequest(BaseModel):
     )
 
 
+class DispatchInstructions(BaseModel):
+    """Approved carrier dispatch parameters returned to authorized IO device."""
+
+    service_number: str = Field(
+        description="Approved carrier service number or shortcode",
+    )
+    sms_body: str = Field(
+        description="Formatted carrier command SMS payload",
+    )
+    operator_code: str = Field(
+        description="Operator identifier code",
+    )
+    sim_slot_index: int = Field(
+        default=0,
+        description="SIM slot index to use on authorized device",
+    )
+
+
+class LocationSendStatusUpdate(BaseModel):
+    """Schema for reporting Android device SMS dispatch outcome."""
+
+    success: bool = Field(
+        description="Whether SMS was successfully dispatched by device",
+    )
+    delivery_status: Optional[str] = Field(
+        default=None,
+        description="Telephony status, e.g. SENT, DELIVERED, RESULT_OK",
+    )
+    error_message: Optional[str] = Field(
+        default=None,
+        description="Diagnostic error if SMS sending failed",
+    )
+
+
 class LocationResultSubmission(BaseModel):
     """Schema for submitting incoming telecom SMS reply."""
 
@@ -125,3 +159,4 @@ class LocationResultSubmission(BaseModel):
         default=None,
         description="Device timestamp when SMS reply was intercepted",
     )
+

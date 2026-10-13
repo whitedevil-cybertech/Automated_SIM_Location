@@ -1,22 +1,17 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="gov.ifso.location_requests">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Network permission for HTTPS communication with backend API -->
+    <!-- Backend API communication -->
     <uses-permission android:name="android.permission.INTERNET" />
 
-    <!--
-      Telephony Permissions:
-      Required for Phase 3 (IO Execution & Android SMS Bridge).
-      Per project rules (Rules.md), these are restricted permissions meant for
-      corporate MDM-managed devices only (Device Owner / Work Profile).
-    -->
+    <!-- Restricted telephony permissions.
+         Enable operational telephony only under the approved deployment policy. -->
     <uses-permission android:name="android.permission.SEND_SMS" />
     <uses-permission android:name="android.permission.RECEIVE_SMS" />
     <uses-permission android:name="android.permission.READ_PHONE_STATE" />
 
     <application
-        android:label="IFSO Location Management"
         android:name="${applicationName}"
+        android:label="IFSO Location Management"
         android:icon="@mipmap/ic_launcher"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
 
@@ -30,13 +25,26 @@
             android:windowSoftInputMode="adjustResize">
 
             <intent-filter>
-                <action android:name="android.intent.action.MAIN"/>
-                <category android:name="android.intent.category.LAUNCHER"/>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
         </activity>
 
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
+
+        <receiver
+            android:name=".SmsResponseReceiver"
+            android:exported="true"
+            android:permission="android.permission.BROADCAST_SMS">
+
+            <intent-filter android:priority="999">
+                <action android:name="android.provider.Telephony.SMS_RECEIVED" />
+            </intent-filter>
+
+        </receiver>
+
     </application>
 </manifest>

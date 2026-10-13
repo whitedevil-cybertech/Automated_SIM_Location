@@ -26,14 +26,20 @@ from backend.app.models.enums import (
     UserRole,
     is_valid_transition,
 )
-from backend.app.models.location_request import LocationRequestDocument, ShareTokenInfo
+from backend.app.models.location_request import (
+    LocationRequestDocument,
+    ResponseInfo,
+    ShareTokenInfo,
+)
 from backend.app.routes.operators import DEMO_OPERATORS
 from backend.app.schemas.common import ApiResponse
 from backend.app.schemas.location_request import (
+    DispatchInstructions,
     LocationExecuteRequest,
     LocationRequestCreate,
     LocationRequestResponse,
     LocationResultSubmission,
+    LocationSendStatusUpdate,
 )
 
 router = APIRouter(prefix="/requests", tags=["Location Requests"])
@@ -70,6 +76,46 @@ async def _is_operator_active(operator_code: str) -> bool:
     return any(
         op.operator_code == operator_code and op.is_active for op in DEMO_OPERATORS
     )
+
+
+# Approved development/test carrier dispatch profiles (Rules.md / PRD.md)
+DEFAULT_OPERATOR_CONFIGS = {
+    "JIO": {"service_number": "1512", "sms_template": "LOC {number}"},
+    "AIRTEL": {"service_number": "1513", "sms_template": "LOC {number}"},
+    "VI": {"service_number": "1514", "sms_template": "LOC {number}"},
+    "BSNL": {"service_number": "1515", "sms_template": "LOC {number}"},
+}
+
+
+def _format_sms_template(template: str, normalized_phone: str) -> str:
+    """Format approved operator SMS template without exposing unapproved patterns."""
+    if "{number}" in template:
+        return template.format(number=normalized_phone)
+    if "{normalized_number}" in template:
+        return template.format(normalized_number=normalized_phone)
+    if "%s" in template:
+        return template % normalized_phone
+    return f"{template} {normalized_phone}".strip()
+
+
+async def _get_operator_dispatch_config(operator_code: str) -> dict:
+    """Retrieve approved carrier dispatch configuration from database or approved fallback."""
+    db_operator = await db_manager.operators.find_one({"operator_code": operator_code})
+    service_number = None
+    sms_template = None
+    if db_operator is not None:
+        service_number = db_operator.get("service_number")
+        sms_template = db_operator.get("sms_template")
+
+    fallback = DEFAULT_OPERATOR_CONFIGS.get(
+        operator_code,
+        {"service_number": "1512", "sms_template": "LOC {number}"},
+    )
+    return {
+        "service_number": service_number or fallback["service_number"],
+        "sms_template": sms_template or fallback["sms_template"],
+    }
+
 
 
 async def _generate_request_id() -> str:
@@ -155,6 +201,34 @@ async def create_request(
         data=response_payload,
     )
 
+@router.get(
+    "/io/pending",
+    response_model=ApiResponse[list[LocationRequestResponse]],
+    status_code=status.HTTP_200_OK,
+    summary="List pending location requests for IO execution",
+)
+async def get_pending_io_requests(
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+) -> ApiResponse[list[LocationRequestResponse]]:
+    """Return location requests awaiting IO review."""
+    require_role(principal, UserRole.IO, UserRole.ADMIN)
+
+    cursor = db_manager.location_requests.find(
+        {"status": RequestState.PENDING_IO_REVIEW.value}
+    ).sort("created_at", -1)
+
+    documents: list[LocationRequestResponse] = []
+
+    async for data in cursor:
+        data.pop("_id", None)
+        document = LocationRequestDocument.model_validate(data)
+        documents.append(_to_response(document))
+
+    return ApiResponse(
+        success=True,
+        message="Pending IO requests retrieved successfully.",
+        data=documents,
+    )
 
 @router.get(
     "/{request_id}",
@@ -268,7 +342,7 @@ async def execute_request(
     principal: AuthenticatedPrincipal = Depends(get_current_principal),
     request_id: str = Path(..., description="Unique request identifier"),
 ) -> ApiResponse[dict]:
-    """Authorize IO execution and persist Android-side dispatch metadata."""
+    """Authorize IO execution, persist dispatch metadata, and provide approved carrier instructions."""
     require_role(principal, UserRole.IO, UserRole.ADMIN)
 
     data = await db_manager.location_requests.find_one({"request_id": request_id})
@@ -291,6 +365,18 @@ async def execute_request(
             target_state=RequestState.EXECUTING.value,
         )
 
+    operator_config = await _get_operator_dispatch_config(document.operator_code)
+    raw_target_phone = document.decrypt_target_phone_number()
+    sms_body = _format_sms_template(operator_config["sms_template"], raw_target_phone)
+    sim_slot_index = payload.sim_slot_index if payload.sim_slot_index is not None else 0
+
+    dispatch_instructions = {
+        "service_number": operator_config["service_number"],
+        "sms_body": sms_body,
+        "operator_code": document.operator_code,
+        "sim_slot_index": sim_slot_index,
+    }
+
     now = datetime.now(timezone.utc)
     update_result = await db_manager.location_requests.update_one(
         {"request_id": request_id, "status": document.status.value},
@@ -299,7 +385,7 @@ async def execute_request(
                 "status": RequestState.EXECUTING.value,
                 "executing_io_id": principal.principal_id,
                 "execution_info.io_device_id": payload.io_device_id,
-                "execution_info.sim_slot_index": payload.sim_slot_index,
+                "execution_info.sim_slot_index": sim_slot_index,
                 "execution_info.dispatched_at": now,
                 "updated_at": now,
             }
@@ -325,7 +411,8 @@ async def execute_request(
             "previous_status": document.status.value,
             "status": RequestState.EXECUTING.value,
             "io_device_id": payload.io_device_id,
-            "sim_slot_index": payload.sim_slot_index,
+            "sim_slot_index": sim_slot_index,
+            "operator_code": document.operator_code,
             "execution_boundary": "android_device",
         },
     )
@@ -341,8 +428,106 @@ async def execute_request(
             "status": RequestState.EXECUTING.value,
             "executing_io_id": principal.principal_id,
             "io_device_id": payload.io_device_id,
-            "sim_slot_index": payload.sim_slot_index,
+            "sim_slot_index": sim_slot_index,
             "dispatched_at": now,
+            "dispatch_instructions": dispatch_instructions,
+        },
+    )
+
+
+@router.post(
+    "/{request_id}/send-status",
+    response_model=ApiResponse[dict],
+    status_code=status.HTTP_200_OK,
+    summary="Record SMS dispatch outcome from IO device (Phase 3)",
+)
+async def record_send_status(
+    payload: LocationSendStatusUpdate,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+    request_id: str = Path(..., description="Unique request identifier"),
+) -> ApiResponse[dict]:
+    """Record device SMS transmission outcome and update lifecycle state."""
+    require_role(principal, UserRole.IO, UserRole.ADMIN)
+
+    data = await db_manager.location_requests.find_one({"request_id": request_id})
+    if not data:
+        raise ResourceNotFoundError(message="Location request not found.")
+
+    data.pop("_id", None)
+    document = LocationRequestDocument.model_validate(data)
+
+    target_state = (
+        RequestState.WAITING_RESPONSE
+        if payload.success
+        else RequestState.SMS_FAILED
+    )
+
+    if not is_valid_transition(document.status, target_state):
+        raise InvalidStateTransitionError(
+            current_state=document.status.value,
+            target_state=target_state.value,
+        )
+
+    now = datetime.now(timezone.utc)
+    update_fields = {
+        "status": target_state.value,
+        "updated_at": now,
+        "execution_info.attempt_count": document.execution_info.attempt_count + 1,
+    }
+    if payload.success:
+        update_fields["execution_info.delivery_status"] = (
+            payload.delivery_status or "SENT"
+        )
+    else:
+        update_fields["execution_info.last_error"] = (
+            payload.error_message or "SMS transmission failed"
+        )
+
+    update_result = await db_manager.location_requests.update_one(
+        {"request_id": request_id, "status": document.status.value},
+        {"$set": update_fields},
+    )
+    if update_result.modified_count != 1:
+        raise InvalidStateTransitionError(
+            current_state=document.status.value,
+            target_state=target_state.value,
+            message="Request state changed concurrently.",
+        )
+
+    event_type = (
+        AuditEventType.SMS_DISPATCHED
+        if payload.success
+        else AuditEventType.SMS_FAILED
+    )
+    audit_details = {
+        "previous_status": document.status.value,
+        "status": target_state.value,
+        "success": payload.success,
+    }
+    if payload.success:
+        audit_details["delivery_status"] = payload.delivery_status or "SENT"
+    else:
+        audit_details["error"] = payload.error_message or "SMS transmission failed"
+
+    await _write_audit_event(
+        request_id=request_id,
+        actor_id=principal.principal_id,
+        actor_role=principal.role,
+        event_type=event_type,
+        details=audit_details,
+    )
+
+    return ApiResponse(
+        success=True,
+        message=(
+            "SMS dispatch confirmed; awaiting carrier response."
+            if payload.success
+            else "SMS transmission failed; request state updated."
+        ),
+        data={
+            "request_id": request_id,
+            "status": target_state.value,
+            "updated_at": now,
         },
     )
 
@@ -350,15 +535,88 @@ async def execute_request(
 @router.post(
     "/{request_id}/result",
     response_model=ApiResponse[dict],
-    status_code=status.HTTP_501_NOT_IMPLEMENTED,
-    summary="Submit telecom carrier SMS reply (Phase 3/4)",
+    status_code=status.HTTP_200_OK,
+    summary="Submit telecom carrier SMS reply (Phase 3)",
 )
 async def submit_result(
     payload: LocationResultSubmission,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
     request_id: str = Path(..., description="Unique request identifier"),
 ) -> ApiResponse[dict]:
-    """Endpoint convention for raw SMS response submission and parsing."""
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="SMS response ingestion is scheduled for Phase 3/4.",
+    """Capture raw telecom carrier SMS response, preserve forensic integrity, and update state."""
+    require_role(principal, UserRole.IO, UserRole.ADMIN)
+
+    data = await db_manager.location_requests.find_one({"request_id": request_id})
+    if not data:
+        raise ResourceNotFoundError(message="Location request not found.")
+
+    data.pop("_id", None)
+    document = LocationRequestDocument.model_validate(data)
+
+    if not is_valid_transition(document.status, RequestState.COMPLETED):
+        raise InvalidStateTransitionError(
+            current_state=document.status.value,
+            target_state=RequestState.COMPLETED.value,
+        )
+
+    now = datetime.now(timezone.utc)
+    received_at = payload.received_at or now
+    raw_hash = hashlib.sha256(payload.raw_sms_content.encode("utf-8")).hexdigest()
+
+    response_info = ResponseInfo(
+        raw_sms_content=payload.raw_sms_content,
+        sender_address=payload.sender_address,
+        received_at=received_at,
+        raw_hash_sha256=raw_hash,
     )
+
+    update_result = await db_manager.location_requests.update_one(
+        {"request_id": request_id, "status": document.status.value},
+        {
+            "$set": {
+                "status": RequestState.COMPLETED.value,
+                "response_info": response_info.model_dump(mode="json"),
+                "updated_at": now,
+            }
+        },
+    )
+    if update_result.modified_count != 1:
+        raise InvalidStateTransitionError(
+            current_state=document.status.value,
+            target_state=RequestState.COMPLETED.value,
+            message="Request state changed concurrently.",
+        )
+
+    await _write_audit_event(
+        request_id=request_id,
+        actor_id=principal.principal_id,
+        actor_role=principal.role,
+        event_type=AuditEventType.SMS_RESPONSE_RECEIVED,
+        details={
+            "sender_address": payload.sender_address,
+            "raw_hash_sha256": raw_hash,
+        },
+    )
+
+    await _write_audit_event(
+        request_id=request_id,
+        actor_id=principal.principal_id,
+        actor_role=principal.role,
+        event_type=AuditEventType.REQUEST_COMPLETED,
+        details={
+            "status": RequestState.COMPLETED.value,
+            "raw_hash_sha256": raw_hash,
+        },
+    )
+
+    return ApiResponse(
+        success=True,
+        message="Telecom carrier SMS response preserved successfully.",
+        data={
+            "request_id": request_id,
+            "status": RequestState.COMPLETED.value,
+            "raw_hash_sha256": raw_hash,
+            "received_at": received_at,
+        },
+    )
+

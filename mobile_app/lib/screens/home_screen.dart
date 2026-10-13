@@ -1,14 +1,32 @@
 import 'package:flutter/material.dart';
+
 import '../core/constants/request_states.dart';
 import '../core/theme/color_schemes.dart';
 import '../core/theme/radius.dart';
 import '../core/theme/spacing.dart';
 import '../core/theme/typography.dart';
+import '../services/api_service.dart';
+import '../services/telephony_bridge.dart';
+import 'io_pending_requests_screen.dart';
+import 'officer_request_screen.dart';
 
 /// Application Shell / Home Dashboard for Phase 1.
 /// Establishes the visual hierarchy, layout tokens, and forensic status indicators.
 class HomeScreen extends StatelessWidget {
-  const HomeScreen({super.key});
+  const HomeScreen({
+    super.key,
+    required this.apiService,
+    required this.officerApiService,
+    required this.ioDeviceId,
+    this.simSlotIndex = 0,
+    this.telephonyBridge,
+  });
+
+  final ApiService apiService;
+  final ApiService officerApiService;
+  final String ioDeviceId;
+  final int simSlotIndex;
+  final TelephonyBridge? telephonyBridge;
 
   @override
   Widget build(BuildContext context) {
@@ -168,50 +186,63 @@ class HomeScreen extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text('Planned Workflows', style: theme.textTheme.titleMedium),
+        Text('Operational Workflows', style: theme.textTheme.titleMedium),
         const SizedBox(height: AppSpacing.space2),
         Row(
           children: [
             // Officer Module Card
             Expanded(
-              child: Card(
-                margin: EdgeInsets.zero,
-                child: Padding(
-                  padding: const EdgeInsets.all(AppSpacing.space4),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Icon(
-                        Icons.badge_outlined,
-                        color: AppColors.primary,
-                        size: 24,
+              child: InkWell(
+                borderRadius: AppRadius.borderMedium,
+                onTap: () {
+                  Navigator.of(context).push(
+                    MaterialPageRoute<void>(
+                      builder: (_) => OfficerRequestScreen(
+                        apiService: officerApiService,
                       ),
-                      const SizedBox(height: AppSpacing.space2),
-                      Text('Officer Module', style: theme.textTheme.titleSmall),
-                      const SizedBox(height: AppSpacing.space1),
-                      Text(
-                        'Request creation & secure link sharing.',
-                        style: theme.textTheme.bodySmall,
-                      ),
-                      const SizedBox(height: AppSpacing.space3),
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: AppSpacing.space2,
-                          vertical: AppSpacing.space1,
+                    ),
+                  );
+                },
+                child: Card(
+                  margin: EdgeInsets.zero,
+                  child: Padding(
+                    padding: const EdgeInsets.all(AppSpacing.space4),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Icon(
+                          Icons.badge_outlined,
+                          color: AppColors.primary,
+                          size: 24,
                         ),
-                        decoration: BoxDecoration(
-                          color: AppColors.warningContainer,
-                          borderRadius: AppRadius.borderSmall,
+                        const SizedBox(height: AppSpacing.space2),
+                        Text('Officer Module',
+                            style: theme.textTheme.titleSmall),
+                        const SizedBox(height: AppSpacing.space1),
+                        Text(
+                          'Request creation & secure link sharing.',
+                          style: theme.textTheme.bodySmall,
                         ),
-                        child: Text(
-                          'Phase 2 Target',
-                          style: AppTypography.technicalBold.copyWith(
-                            fontSize: 11,
-                            color: AppColors.warning,
+                        const SizedBox(height: AppSpacing.space3),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: AppSpacing.space2,
+                            vertical: AppSpacing.space1,
+                          ),
+                          decoration: const BoxDecoration(
+                            color: AppColors.warningContainer,
+                            borderRadius: AppRadius.borderSmall,
+                          ),
+                          child: Text(
+                            'Create & Share',
+                            style: AppTypography.technicalBold.copyWith(
+                              fontSize: 11,
+                              color: AppColors.warning,
+                            ),
                           ),
                         ),
-                      ),
-                    ],
+                      ],
+                    ),
                   ),
                 ),
               ),
@@ -219,44 +250,59 @@ class HomeScreen extends StatelessWidget {
             const SizedBox(width: AppSpacing.space3),
             // IO Module Card
             Expanded(
-              child: Card(
-                margin: EdgeInsets.zero,
-                child: Padding(
-                  padding: const EdgeInsets.all(AppSpacing.space4),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Icon(
-                        Icons.phonelink_lock_outlined,
-                        color: AppColors.secondary,
-                        size: 24,
+              child: InkWell(
+                borderRadius: AppRadius.borderMedium,
+                onTap: () {
+                  Navigator.of(context).push(
+                    MaterialPageRoute<void>(
+                      builder: (_) => IoPendingRequestsScreen(
+                        apiService: apiService,
+                        ioDeviceId: ioDeviceId,
+                        simSlotIndex: simSlotIndex,
+                        telephonyBridge: telephonyBridge,
                       ),
-                      const SizedBox(height: AppSpacing.space2),
-                      Text('IO Execution', style: theme.textTheme.titleSmall),
-                      const SizedBox(height: AppSpacing.space1),
-                      Text(
-                        'Authorized SIM SMS transmission.',
-                        style: theme.textTheme.bodySmall,
-                      ),
-                      const SizedBox(height: AppSpacing.space3),
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: AppSpacing.space2,
-                          vertical: AppSpacing.space1,
+                    ),
+                  );
+                },
+                child: Card(
+                  margin: EdgeInsets.zero,
+                  child: Padding(
+                    padding: const EdgeInsets.all(AppSpacing.space4),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Icon(
+                          Icons.phonelink_lock_outlined,
+                          color: AppColors.secondary,
+                          size: 24,
                         ),
-                        decoration: BoxDecoration(
-                          color: AppColors.infoContainer,
-                          borderRadius: AppRadius.borderSmall,
+                        const SizedBox(height: AppSpacing.space2),
+                        Text('IO Execution', style: theme.textTheme.titleSmall),
+                        const SizedBox(height: AppSpacing.space1),
+                        Text(
+                          'Review pending requests and continue authorized execution.',
+                          style: theme.textTheme.bodySmall,
                         ),
-                        child: Text(
-                          'Phase 3 Target',
-                          style: AppTypography.technicalBold.copyWith(
-                            fontSize: 11,
-                            color: AppColors.info,
+                        const SizedBox(height: AppSpacing.space3),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: AppSpacing.space2,
+                            vertical: AppSpacing.space1,
+                          ),
+                          decoration: const BoxDecoration(
+                            color: AppColors.successContainer,
+                            borderRadius: AppRadius.borderSmall,
+                          ),
+                          child: Text(
+                            'Open Pending Queue',
+                            style: AppTypography.technicalBold.copyWith(
+                              fontSize: 11,
+                              color: AppColors.success,
+                            ),
                           ),
                         ),
-                      ),
-                    ],
+                      ],
+                    ),
                   ),
                 ),
               ),

@@ -55,23 +55,74 @@ ApiService _buildApiService({
   );
 }
 
+http.Response _successResponse({
+  String message = 'Execution authorization recorded.',
+}) {
+  return http.Response(
+    jsonEncode({
+      'success': true,
+      'message': message,
+      'data': {
+        'request_id': 'REQ-TEST-001',
+        'status': 'EXECUTING',
+        'io_device_id': 'TEST-DEVICE-001',
+        'sim_slot_index': 0,
+      },
+      'timestamp': '2026-10-01T10:40:00Z',
+    }),
+    200,
+    headers: {'content-type': 'application/json'},
+  );
+}
+
+http.Response _errorResponse({
+  required String code,
+  required String message,
+  required int statusCode,
+}) {
+  return http.Response(
+    jsonEncode({
+      'success': false,
+      'error': {
+        'code': code,
+        'message': message,
+        'details': <String, dynamic>{},
+      },
+      'timestamp': '2026-10-01T10:40:00Z',
+    }),
+    statusCode,
+    headers: {'content-type': 'application/json'},
+  );
+}
+
 Future<void> _openConfirmationDialog(WidgetTester tester) async {
-  final executeButton = find.text('Execute Location Request');
+  final authorizeButton = find.text('Authorize Execution');
 
   await tester.scrollUntilVisible(
-    executeButton,
-    500,
-    scrollable: find.byType(Scrollable),
+    authorizeButton,
+    300,
+    scrollable: find.byType(Scrollable).first,
   );
-
-  expect(executeButton, findsOneWidget);
-
-  await tester.tap(executeButton);
   await tester.pumpAndSettle();
 
-  expect(find.text('Confirm Location Request'), findsOneWidget);
-  expect(find.text('Confirm Execution'), findsOneWidget);
+  expect(authorizeButton, findsOneWidget);
+
+  await tester.tap(authorizeButton);
+  await tester.pumpAndSettle();
+
+  expect(find.text('Confirm Execution Authorization'), findsOneWidget);
+  expect(find.text('Confirm'), findsOneWidget);
   expect(find.text('Cancel'), findsOneWidget);
+}
+
+Future<void> _confirmAuthorization(WidgetTester tester) async {
+  await _openConfirmationDialog(tester);
+
+  await tester.tap(find.text('Confirm'));
+  await tester.pumpAndSettle();
+
+  // Do not call ensureVisible() here.
+  // The workflow status widget may not exist when the request fails.
 }
 
 void main() {
@@ -80,16 +131,7 @@ void main() {
       'renders pending IO review request details',
       (tester) async {
         final apiService = _buildApiService(
-          handler: (_) async => http.Response(
-            jsonEncode({
-              'success': true,
-              'message': 'Execution authorized.',
-              'data': {},
-              'timestamp': '2026-10-01T10:40:00Z',
-            }),
-            200,
-            headers: {'content-type': 'application/json'},
-          ),
+          handler: (_) async => _successResponse(),
         );
 
         await tester.pumpWidget(
@@ -99,37 +141,41 @@ void main() {
           ),
         );
 
+        expect(find.text('IO Request Review'), findsOneWidget);
         expect(find.text('LOCATION REQUEST'), findsOneWidget);
         expect(find.text('REQ-TEST-001'), findsOneWidget);
         expect(find.text('+91 XXXXXXX123'), findsOneWidget);
         expect(find.text('JIO'), findsOneWidget);
         expect(find.text('CASE-TEST-001'), findsOneWidget);
         expect(
-           find.text(RequestState.pendingIoReview.label),
-           findsOneWidget,
-        );
-        await tester.scrollUntilVisible(
-           find.text('Execute Location Request'),
-           500,
-           scrollable: find.byType(Scrollable),
+          find.text(RequestState.pendingIoReview.label),
+          findsOneWidget,
         );
 
-        expect(find.text('Execute Location Request'), findsOneWidget);
+        await tester.scrollUntilVisible(
+          find.text('Authorize Execution'),
+          300,
+          scrollable: find.byType(Scrollable).first,
+        );
+        await tester.pumpAndSettle();
+
+        expect(find.text('Authorize Execution'), findsOneWidget);
+        expect(find.text('Request Details'), findsOneWidget);
+        expect(find.text('Execution Context'), findsOneWidget);
+        expect(
+          find.text('This screen records execution authorization only. '
+              'It does not send carrier SMS commands, retrieve '
+              'locations, or collect carrier responses.'),
+          findsOneWidget,
+        );
       },
     );
 
     testWidgets(
-      'displays created timestamp',
+      'displays the created timestamp',
       (tester) async {
         final apiService = _buildApiService(
-          handler: (_) async => http.Response(
-            jsonEncode({
-              'success': true,
-              'data': {},
-              'timestamp': '2026-10-01T10:40:00Z',
-            }),
-            200,
-          ),
+          handler: (_) async => _successResponse(),
         );
 
         await tester.pumpWidget(
@@ -139,27 +185,21 @@ void main() {
           ),
         );
 
-        expect(find.textContaining('Created'), findsOneWidget);
+        expect(find.text('Created'), findsOneWidget);
         expect(find.textContaining('2026'), findsWidgets);
+        expect(find.textContaining('UTC'), findsOneWidget);
       },
     );
 
     testWidgets(
-      'opens explicit confirmation dialog before execution',
+      'opens confirmation before calling the API',
       (tester) async {
         var requestCount = 0;
 
         final apiService = _buildApiService(
           handler: (_) async {
             requestCount++;
-            return http.Response(
-              jsonEncode({
-                'success': true,
-                'data': {},
-                'timestamp': '2026-10-01T10:40:00Z',
-              }),
-              200,
-            );
+            return _successResponse();
           },
         );
 
@@ -174,32 +214,32 @@ void main() {
 
         expect(
           find.textContaining(
-            'Executing this request will authorize the location workflow',
-            ),
-            findsOneWidget,
+            'Confirm that this request has been reviewed and is',
+          ),
+          findsOneWidget,
         );
 
-        // Opening the dialog must not execute the request.
+        expect(
+          find.textContaining(
+            'It does not send SMS messages or retrieve a device location.',
+          ),
+          findsOneWidget,
+        );
+
+        // Opening the dialog must not submit the request.
         expect(requestCount, 0);
       },
     );
 
     testWidgets(
-      'canceling confirmation does not call API',
+      'cancelling confirmation does not call the API',
       (tester) async {
         var requestCount = 0;
 
         final apiService = _buildApiService(
           handler: (_) async {
             requestCount++;
-            return http.Response(
-              jsonEncode({
-                'success': true,
-                'data': {},
-                'timestamp': '2026-10-01T10:40:00Z',
-              }),
-              200,
-            );
+            return _successResponse();
           },
         );
 
@@ -215,39 +255,24 @@ void main() {
         await tester.tap(find.text('Cancel'));
         await tester.pumpAndSettle();
 
-        expect(find.text('Confirm Location Request'), findsNothing);
+        expect(
+          find.text('Confirm Execution Authorization'),
+          findsNothing,
+        );
         expect(requestCount, 0);
-        expect(find.text('Execute Location Request'), findsOneWidget);
+        expect(find.text('Authorize Execution'), findsOneWidget);
       },
     );
 
     testWidgets(
-      'confirming execution calls correct API and shows success',
+      'confirmation submits the expected authorization API request',
       (tester) async {
         http.Request? capturedRequest;
 
         final apiService = _buildApiService(
           handler: (request) async {
             capturedRequest = request;
-
-            return http.Response(
-              jsonEncode({
-                'success': true,
-                'message':
-                    'Execution authorized and recorded. Backend did not dispatch SMS; Android device execution boundary remains enforced.',
-                'data': {
-                  'request_id': 'REQ-TEST-001',
-                  'status': 'EXECUTING',
-                  'executing_io_id': 'IO-001',
-                  'io_device_id': 'TEST-DEVICE-001',
-                  'sim_slot_index': 0,
-                  'dispatched_at': '2026-10-01T10:40:00Z',
-                },
-                'timestamp': '2026-10-01T10:40:00Z',
-              }),
-              200,
-              headers: {'content-type': 'application/json'},
-            );
+            return _successResponse();
           },
         );
 
@@ -258,10 +283,7 @@ void main() {
           ),
         );
 
-        await _openConfirmationDialog(tester);
-
-        await tester.tap(find.text('Confirm Execution'));
-        await tester.pumpAndSettle();
+        await _confirmAuthorization(tester);
 
         expect(capturedRequest, isNotNull);
         expect(capturedRequest!.method, 'POST');
@@ -288,12 +310,22 @@ void main() {
           },
         );
 
-        expect(find.text('Execution Authorized'), findsOneWidget);
+        expect(
+          find.text('Authorization Recorded'),
+          findsOneWidget,
+        );
+
+        expect(
+          find.textContaining(
+            'No SMS was sent by this screen.',
+          ),
+          findsOneWidget,
+        );
       },
     );
 
     testWidgets(
-      'shows loading state while execution is in progress',
+      'shows loading state while authorization is being recorded',
       (tester) async {
         final responseCompleter = Completer<http.Response>();
 
@@ -310,35 +342,32 @@ void main() {
 
         await _openConfirmationDialog(tester);
 
-        await tester.tap(find.text('Confirm Execution'));
+        await tester.tap(find.text('Confirm'));
         await tester.pump();
 
-        expect(find.text('Executing...'), findsOneWidget);
-        expect(find.text('Execution Authorized'), findsNothing);
-
-        responseCompleter.complete(
-          http.Response(
-            jsonEncode({
-              'success': true,
-              'data': {
-                'request_id': 'REQ-TEST-001',
-                'status': 'EXECUTING',
-              },
-              'timestamp': '2026-10-01T10:40:00Z',
-            }),
-            200,
-          ),
+        expect(
+          find.text('Recording Authorization...'),
+          findsOneWidget,
         );
+        expect(find.text('Authorization Recorded'), findsNothing);
+
+        responseCompleter.complete(_successResponse());
 
         await tester.pumpAndSettle();
 
-        expect(find.text('Execution Authorized'), findsOneWidget);
-        expect(find.text('Executing...'), findsNothing);
+        expect(
+          find.text('Authorization Recorded'),
+          findsOneWidget,
+        );
+        expect(
+          find.text('Recording Authorization...'),
+          findsNothing,
+        );
       },
     );
 
     testWidgets(
-      'prevents duplicate execution while request is loading',
+      'prevents duplicate submissions while the request is loading',
       (tester) async {
         final responseCompleter = Completer<http.Response>();
         var requestCount = 0;
@@ -359,32 +388,26 @@ void main() {
 
         await _openConfirmationDialog(tester);
 
-        await tester.tap(find.text('Confirm Execution'));
+        await tester.tap(find.text('Confirm'));
         await tester.pump();
 
         expect(requestCount, 1);
-        expect(find.text('Executing...'), findsOneWidget);
+        expect(
+          find.text('Recording Authorization...'),
+          findsOneWidget,
+        );
 
-        // The button is disabled while execution is active.
+
         final button = tester.widget<ElevatedButton>(
-          find.widgetWithText(ElevatedButton, 'Executing...'),
+          find.widgetWithText(
+            ElevatedButton,
+            'Recording Authorization...',
+          ),
         );
 
         expect(button.onPressed, isNull);
 
-        responseCompleter.complete(
-          http.Response(
-            jsonEncode({
-              'success': true,
-              'data': {
-                'request_id': 'REQ-TEST-001',
-                'status': 'EXECUTING',
-              },
-              'timestamp': '2026-10-01T10:40:00Z',
-            }),
-            200,
-          ),
-        );
+        responseCompleter.complete(_successResponse());
 
         await tester.pumpAndSettle();
 
@@ -393,20 +416,13 @@ void main() {
     );
 
     testWidgets(
-      'handles 401 unauthorized response',
+      'displays an error for an unauthorized session',
       (tester) async {
         final apiService = _buildApiService(
-          handler: (_) async => http.Response(
-            jsonEncode({
-              'success': false,
-              'error': {
-                'code': 'UNAUTHORIZED',
-                'message': 'Authentication required.',
-                'details': {},
-              },
-              'timestamp': '2026-10-01T10:40:00Z',
-            }),
-            401,
+          handler: (_) async => _errorResponse(
+            code: 'UNAUTHORIZED',
+            message: 'Authentication required.',
+            statusCode: 401,
           ),
         );
 
@@ -417,35 +433,27 @@ void main() {
           ),
         );
 
-        await _openConfirmationDialog(tester);
-
-        await tester.tap(find.text('Confirm Execution'));
-        await tester.pumpAndSettle();
+        await _confirmAuthorization(tester);
 
         expect(
-          find.text('Your session is not authorized.'),
+          find.descendant(
+            of: find.byKey(const ValueKey('workflow-status-card')),
+            matching: find.text('Your session is not authorized.'),
+          ),
           findsOneWidget,
         );
-
-        expect(find.text('Execute Location Request'), findsOneWidget);
+        expect(find.text('Authorize Execution'), findsOneWidget);
       },
     );
 
     testWidgets(
-      'handles 403 forbidden response',
+      'displays an error when the user lacks permission',
       (tester) async {
         final apiService = _buildApiService(
-          handler: (_) async => http.Response(
-            jsonEncode({
-              'success': false,
-              'error': {
-                'code': 'FORBIDDEN',
-                'message': 'Insufficient permissions.',
-                'details': {},
-              },
-              'timestamp': '2026-10-01T10:40:00Z',
-            }),
-            403,
+          handler: (_) async => _errorResponse(
+            code: 'FORBIDDEN',
+            message: 'Insufficient permissions.',
+            statusCode: 403,
           ),
         );
 
@@ -456,91 +464,11 @@ void main() {
           ),
         );
 
-        await _openConfirmationDialog(tester);
-
-        await tester.tap(find.text('Confirm Execution'));
-        await tester.pumpAndSettle();
-
-        expect(
-          find.text('You are not authorized to execute this request.'),
-          findsOneWidget,
-        );
-      },
-    );
-
-    testWidgets(
-      'handles invalid request state response',
-      (tester) async {
-        final apiService = _buildApiService(
-          handler: (_) async => http.Response(
-            jsonEncode({
-              'success': false,
-              'error': {
-                'code': 'INVALID_STATE_TRANSITION',
-                'message': 'Invalid request state.',
-                'details': {},
-              },
-              'timestamp': '2026-10-01T10:40:00Z',
-            }),
-            409,
-          ),
-        );
-
-        await tester.pumpWidget(
-          _buildTestApp(
-            request: _buildRequest(),
-            apiService: apiService,
-          ),
-        );
-
-        await _openConfirmationDialog(tester);
-
-        await tester.tap(find.text('Confirm Execution'));
-        await tester.pumpAndSettle();
-
-        expect(
-          find.text('The request is no longer awaiting IO review.'),
-          findsOneWidget,
-        );
-      },
-    );
-
-    testWidgets(
-      'handles inactive operator response',
-      (tester) async {
-        final apiService = _buildApiService(
-          handler: (_) async => http.Response(
-            jsonEncode({
-              'success': false,
-              'error': {
-                'code': 'VALIDATION_ERROR',
-                'message': 'Operator is not approved or currently inactive.',
-                'details': {
-                  'field': 'operator_code',
-                  'operator_code': 'JIO',
-                },
-              },
-              'timestamp': '2026-10-01T10:40:00Z',
-            }),
-            422,
-          ),
-        );
-
-        await tester.pumpWidget(
-          _buildTestApp(
-            request: _buildRequest(),
-            apiService: apiService,
-          ),
-        );
-
-        await _openConfirmationDialog(tester);
-
-        await tester.tap(find.text('Confirm Execution'));
-        await tester.pumpAndSettle();
+        await _confirmAuthorization(tester);
 
         expect(
           find.text(
-            'The selected operator is not approved or is currently inactive.',
+            'You are not authorized to execute this request.',
           ),
           findsOneWidget,
         );
@@ -548,7 +476,65 @@ void main() {
     );
 
     testWidgets(
-      'handles network failure',
+      'displays an error for an invalid request state',
+      (tester) async {
+        final apiService = _buildApiService(
+          handler: (_) async => _errorResponse(
+            code: 'INVALID_STATE_TRANSITION',
+            message: 'Invalid request state.',
+            statusCode: 409,
+          ),
+        );
+
+        await tester.pumpWidget(
+          _buildTestApp(
+            request: _buildRequest(),
+            apiService: apiService,
+          ),
+        );
+
+        await _confirmAuthorization(tester);
+
+        expect(
+          find.text(
+            'The request is no longer awaiting IO review.',
+          ),
+          findsOneWidget,
+        );
+      },
+    );
+
+    testWidgets(
+      'displays an error for an inactive operator',
+      (tester) async {
+        final apiService = _buildApiService(
+          handler: (_) async => _errorResponse(
+            code: 'VALIDATION_ERROR',
+            message: 'Operator is not approved or currently inactive.',
+            statusCode: 422,
+          ),
+        );
+
+        await tester.pumpWidget(
+          _buildTestApp(
+            request: _buildRequest(),
+            apiService: apiService,
+          ),
+        );
+
+        await _confirmAuthorization(tester);
+
+        expect(
+          find.text(
+            'Operator is not approved or currently inactive.'
+          ),
+          findsOneWidget,
+        );
+      },
+    );
+
+    testWidgets(
+      'handles network failures',
       (tester) async {
         final apiService = _buildApiService(
           handler: (_) async {
@@ -563,30 +549,22 @@ void main() {
           ),
         );
 
-        await _openConfirmationDialog(tester);
-
-        await tester.tap(find.text('Confirm Execution'));
-        await tester.pumpAndSettle();
+        await _confirmAuthorization(tester);
 
         expect(
           find.text('Unable to connect to the server.'),
           findsOneWidget,
         );
+
+        expect(find.text('Authorize Execution'), findsOneWidget);
       },
     );
 
     testWidgets(
-      'does not allow execution when request is not pending IO review',
+      'disables authorization when the request is not pending IO review',
       (tester) async {
         final apiService = _buildApiService(
-          handler: (_) async => http.Response(
-            jsonEncode({
-              'success': true,
-              'data': {},
-              'timestamp': '2026-10-01T10:40:00Z',
-            }),
-            200,
-          ),
+          handler: (_) async => _successResponse(),
         );
 
         await tester.pumpWidget(
@@ -599,23 +577,22 @@ void main() {
         );
 
         expect(
-           find.text(RequestState.executing.label),
-           findsOneWidget,
-        );
-        await tester.scrollUntilVisible(
-            find.text('Execute Location Request'),
-            500,
-            scrollable: find.byType(Scrollable),
+          find.text(RequestState.executing.label),
+          findsOneWidget,
         );
 
-        expect(find.text('Execute Location Request'), findsOneWidget);
 
-        final button = tester.widget<ElevatedButton>(
-           find.widgetWithText(
-           ElevatedButton,
-           'Execute Location Request',
-           ),
+        expect(find.text('Authorize Execution'), findsOneWidget);
+
+        final buttonFinder = find.ancestor(
+          of: find.text('Authorize Execution'),
+          matching: find.byType(ElevatedButton),
         );
+
+        expect(buttonFinder, findsOneWidget);
+
+        final button = tester.widget<ElevatedButton>(buttonFinder);
+        expect(button.onPressed, isNull);
 
         expect(button.onPressed, isNull);
       },

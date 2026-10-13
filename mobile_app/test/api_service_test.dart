@@ -475,5 +475,97 @@ void main() {
         ),
       );
     });
+
+    test('updateSendStatus dispatches correct endpoint and body', () async {
+      http.Request? capturedRequest;
+
+      final client = MockClient((request) async {
+        capturedRequest = request;
+        return http.Response(
+          jsonEncode({
+            'success': true,
+            'message': 'SMS dispatch confirmed.',
+            'data': {
+              'request_id': 'REQ-100',
+              'status': 'WAITING_RESPONSE',
+            },
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      });
+
+      final apiService = ApiService(
+        baseUrl: 'http://127.0.0.1:8000/api/v1',
+        authToken: 'io-token',
+        client: client,
+      );
+
+      final response = await apiService.updateSendStatus(
+        requestId: 'REQ-100',
+        success: true,
+        deliveryStatus: 'SENT',
+      );
+
+      expect(response['success'], true);
+      expect(capturedRequest, isNotNull);
+      expect(
+        capturedRequest!.url.toString(),
+        'http://127.0.0.1:8000/api/v1/requests/REQ-100/send-status',
+      );
+      expect(
+        jsonDecode(capturedRequest!.body),
+        {
+          'success': true,
+          'delivery_status': 'SENT',
+        },
+      );
+    });
+
+    test('submitResult dispatches correct endpoint and body', () async {
+      http.Request? capturedRequest;
+
+      final client = MockClient((request) async {
+        capturedRequest = request;
+        return http.Response(
+          jsonEncode({
+            'success': true,
+            'message': 'SMS reply preserved.',
+            'data': {
+              'request_id': 'REQ-200',
+              'status': 'COMPLETED',
+            },
+          }),
+          200,
+          headers: {'content-type': 'application/json'},
+        );
+      });
+
+      final apiService = ApiService(
+        baseUrl: 'http://127.0.0.1:8000/api/v1',
+        authToken: 'io-token',
+        client: client,
+      );
+
+      final response = await apiService.submitResult(
+        requestId: 'REQ-200',
+        rawSmsContent: 'Location: LAT:28.6139, LONG:77.2090',
+        senderAddress: '1512',
+      );
+
+      expect(response['success'], true);
+      expect(capturedRequest, isNotNull);
+      expect(
+        capturedRequest!.url.toString(),
+        'http://127.0.0.1:8000/api/v1/requests/REQ-200/result',
+      );
+      expect(
+        jsonDecode(capturedRequest!.body),
+        {
+          'raw_sms_content': 'Location: LAT:28.6139, LONG:77.2090',
+          'sender_address': '1512',
+        },
+      );
+    });
   });
 }

@@ -12,6 +12,7 @@ class LocationRequest {
     this.submittingOfficerId,
     this.executingIoId,
     this.remarks,
+    this.shareableLink,
   });
 
   final String requestId;
@@ -24,6 +25,7 @@ class LocationRequest {
   final String? submittingOfficerId;
   final String? executingIoId;
   final String? remarks;
+  final String? shareableLink;
 
   factory LocationRequest.fromJson(Map<String, dynamic> json) {
     return LocationRequest(
@@ -37,6 +39,7 @@ class LocationRequest {
       submittingOfficerId: json['submitting_officer_id'] as String?,
       executingIoId: json['executing_io_id'] as String?,
       remarks: json['remarks'] as String?,
+      shareableLink: json['shareable_link'] as String?,
     );
   }
 }

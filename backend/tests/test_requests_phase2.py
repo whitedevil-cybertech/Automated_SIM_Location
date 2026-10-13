@@ -9,6 +9,7 @@ import pytest
 
 from backend.app.core.database import db_manager
 from backend.app.models.location_request import LocationRequestDocument
+from backend.tests.conftest import FakeDatabase
 
 
 OFFICER_AUTH = {"Authorization": "Bearer dev-officer-token"}
@@ -41,48 +42,7 @@ def _matches(document: Dict[str, Any], query: Dict[str, Any]) -> bool:
             return False
     return True
 
-
-class FakeCollection:
-    def __init__(self) -> None:
-        self.documents: list[Dict[str, Any]] = []
-
-    async def insert_one(self, document: Dict[str, Any]):
-        self.documents.append(copy.deepcopy(document))
-        return SimpleNamespace(inserted_id=len(self.documents))
-
-    async def find_one(self, query: Dict[str, Any], projection: Dict[str, int] | None = None):
-        for document in self.documents:
-            if _matches(document, query):
-                return copy.deepcopy(document)
-        return None
-
-    async def update_one(self, query: Dict[str, Any], update: Dict[str, Any]):
-        for document in self.documents:
-            if _matches(document, query):
-                for key, value in update.get("$set", {}).items():
-                    _set_nested(document, key, value)
-                return SimpleNamespace(modified_count=1)
-        return SimpleNamespace(modified_count=0)
-
-
-class FakeDatabase:
-    def __init__(self) -> None:
-        self.location_requests = FakeCollection()
-        self.operators = FakeCollection()
-        self.audit_logs = FakeCollection()
-
-    def __getitem__(self, name: str):
-        return getattr(self, name)
-
-
-@pytest.fixture
-def fake_database(monkeypatch: pytest.MonkeyPatch) -> FakeDatabase:
-    fake_db = FakeDatabase()
-    monkeypatch.setattr(db_manager, "get_database", lambda: fake_db)
-    return fake_db
-
-
-async def _create_pending_request(async_client, fake_database: FakeDatabase) -> str:
+async def _create_pending_request(async_client, fake_database) -> str:
     await fake_database.operators.insert_one({"operator_code": "JIO", "is_active": True})
     create_response = await async_client.post(
         "/api/v1/requests",
