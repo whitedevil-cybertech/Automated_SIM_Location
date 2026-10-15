@@ -1,4 +1,4 @@
-"""Application-layer field encryption for sensitive MongoDB values."""
+"""Application-layer field encryption for sensitive request fields."""
 
 from base64 import urlsafe_b64encode
 import hashlib
@@ -47,7 +47,7 @@ def get_field_fernet(settings: Settings | None = None) -> Fernet:
 
 
 def encrypt_phone_number(phone_number: str, settings: Settings | None = None) -> str:
-    """Encrypt a normalized phone number for MongoDB persistence."""
+    """Encrypt a normalized phone number for PostgreSQL persistence."""
     return get_field_fernet(settings).encrypt(phone_number.encode("utf-8")).decode("utf-8")
 
 
@@ -58,4 +58,19 @@ def decrypt_phone_number(ciphertext: str, settings: Settings | None = None) -> s
     except InvalidToken as exc:
         raise SensitiveDataProtectionError(
             "Encrypted phone number could not be decrypted."
+        ) from exc
+
+
+def encrypt_sensitive_text(value: str, settings: Settings | None = None) -> str:
+    """Encrypt sensitive text for database persistence without altering the source value."""
+    return get_field_fernet(settings).encrypt(value.encode("utf-8")).decode("ascii")
+
+
+def decrypt_sensitive_text(value: str, settings: Settings | None = None) -> str:
+    """Decrypt sensitive text for an explicitly authorized response path."""
+    try:
+        return get_field_fernet(settings).decrypt(value.encode("ascii")).decode("utf-8")
+    except (InvalidToken, UnicodeError, ValueError) as exc:
+        raise SensitiveDataProtectionError(
+            "Encrypted evidence could not be decrypted."
         ) from exc

@@ -9,8 +9,8 @@ from backend.app.models.location_request import LocationRequestDocument
 
 
 # Development/testing authentication tokens configured by the application.
-IO_AUTH = {"Authorization": "Bearer dev-io-token"}
-OFFICER_AUTH = {"Authorization": "Bearer dev-officer-token"}
+IO_AUTH = {"Authorization": "Bearer test-io-token"}
+OFFICER_AUTH = {"Authorization": "Bearer test-officer-token"}
 
 
 def _make_request_document(
@@ -38,7 +38,7 @@ def _make_request_document(
 @pytest.mark.asyncio
 async def test_io_can_retrieve_pending_requests(
     async_client,
-    fake_database,
+    postgres_database,
 ):
     """An authenticated IO can retrieve requests awaiting review."""
     now = datetime.now(timezone.utc)
@@ -49,7 +49,7 @@ async def test_io_can_retrieve_pending_requests(
         created_at=now,
     )
 
-    await fake_database.location_requests.insert_one(pending_request)
+    await postgres_database.location_requests.insert_one(pending_request)
 
     response = await async_client.get(
         "/api/v1/requests/io/pending",
@@ -70,7 +70,7 @@ async def test_io_can_retrieve_pending_requests(
 @pytest.mark.asyncio
 async def test_pending_queue_excludes_requests_in_other_states(
     async_client,
-    fake_database,
+    postgres_database,
 ):
     """Only PENDING_IO_REVIEW requests should appear in the IO queue."""
     now = datetime.now(timezone.utc)
@@ -93,9 +93,9 @@ async def test_pending_queue_excludes_requests_in_other_states(
         created_at=now - timedelta(minutes=2),
     )
 
-    await fake_database.location_requests.insert_one(pending_request)
-    await fake_database.location_requests.insert_one(created_request)
-    await fake_database.location_requests.insert_one(executing_request)
+    await postgres_database.location_requests.insert_one(pending_request)
+    await postgres_database.location_requests.insert_one(created_request)
+    await postgres_database.location_requests.insert_one(executing_request)
 
     response = await async_client.get(
         "/api/v1/requests/io/pending",
@@ -119,7 +119,7 @@ async def test_pending_queue_excludes_requests_in_other_states(
 @pytest.mark.asyncio
 async def test_pending_requests_are_ordered_newest_first(
     async_client,
-    fake_database,
+    postgres_database,
 ):
     """The newest pending request should appear first."""
     now = datetime.now(timezone.utc)
@@ -143,9 +143,9 @@ async def test_pending_requests_are_ordered_newest_first(
     )
 
     # Insert them in a different order to verify database sorting.
-    await fake_database.location_requests.insert_one(older_request)
-    await fake_database.location_requests.insert_one(newest_request)
-    await fake_database.location_requests.insert_one(newer_request)
+    await postgres_database.location_requests.insert_one(older_request)
+    await postgres_database.location_requests.insert_one(newest_request)
+    await postgres_database.location_requests.insert_one(newer_request)
 
     response = await async_client.get(
         "/api/v1/requests/io/pending",
@@ -169,7 +169,7 @@ async def test_pending_requests_are_ordered_newest_first(
 @pytest.mark.asyncio
 async def test_officer_cannot_access_pending_io_queue(
     async_client,
-    fake_database,
+    postgres_database,
 ):
     """An officer must not access the IO-only pending queue."""
     response = await async_client.get(
@@ -183,7 +183,7 @@ async def test_officer_cannot_access_pending_io_queue(
 @pytest.mark.asyncio
 async def test_pending_queue_returns_empty_list_when_no_requests_exist(
     async_client,
-    fake_database,
+    postgres_database,
 ):
     """An empty queue should return HTTP 200 and an empty data list."""
     response = await async_client.get(

@@ -40,6 +40,54 @@ class ApiService {
   final String? authToken;
   final http.Client _client;
 
+  Uri _buildUri(String path) {
+    final normalizedBaseUrl = baseUrl.replaceFirst(RegExp(r'/+$'), '');
+    final normalizedPath = path.replaceFirst(RegExp(r'^/+'), '');
+    return Uri.parse('$normalizedBaseUrl/$normalizedPath');
+  }
+
+  /// Returns the role resolved by the backend from the authenticated session.
+  /// The client must not choose or infer its own authorization role.
+  Future<Map<String, dynamic>> getCurrentPrincipal() async {
+    final uri = _buildUri('/auth/me');
+    final headers = <String, String>{'Accept': 'application/json'};
+    final token = authToken;
+    if (token != null && token.isNotEmpty) {
+      headers['Authorization'] = 'Bearer $token';
+    }
+
+    http.Response response;
+    try {
+      response = await _client.get(uri, headers: headers)
+          .timeout(const Duration(seconds: 15));
+    } on TimeoutException {
+      throw const ApiException.network(message: 'The server took too long to authenticate the session.');
+    } on SocketException {
+      throw const ApiException.network(message: 'Unable to connect to the authentication service.');
+    } on http.ClientException {
+      throw const ApiException.network(message: 'Unable to communicate with the authentication service.');
+    }
+
+    final body = _decodeResponse(response.body);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw ApiException(
+        statusCode: response.statusCode,
+        code: _extractErrorCode(body),
+        message: _safeErrorMessage(response.statusCode, body),
+      );
+    }
+    final data = body?['data'];
+    if (body?['success'] != true || data is! Map ||
+        data['principal_id'] is! String || data['role'] is! String) {
+      throw const ApiException(
+        statusCode: 500,
+        code: 'INVALID_IDENTITY_RESPONSE',
+        message: 'The server returned an invalid authenticated identity.',
+      );
+    }
+    return Map<String, dynamic>.from(data);
+  }
+
   /// Creates a request using the authenticated officer identity.
   Future<LocationRequest> createLocationRequest({
     required String caseId,
@@ -80,8 +128,7 @@ class ApiService {
     Map<String, dynamic> payload, {
     String operation = 'execute',
   }) async {
-    final normalizedBaseUrl = baseUrl.replaceFirst(RegExp(r'/+$'), '');
-    final uri = Uri.parse('$normalizedBaseUrl$path');
+    final uri = _buildUri(path);
 
     final headers = <String, String>{
       'Content-Type': 'application/json',
@@ -188,8 +235,7 @@ class ApiService {
 
   /// Retrieves requests that are awaiting IO review.
   Future<List<LocationRequest>> getPendingIoRequests() async {
-    final normalizedBaseUrl = baseUrl.replaceFirst(RegExp(r'/+$'), '');
-    final uri = Uri.parse('$normalizedBaseUrl/requests/io/pending');
+    final uri = _buildUri('/requests/io/pending');
     final headers = <String, String>{'Accept': 'application/json'};
 
     final token = authToken;
@@ -260,8 +306,8 @@ class ApiService {
     required String ioDeviceId,
     required int simSlotIndex,
   }) async {
-    final uri = Uri.parse(
-      '$baseUrl/requests/$requestId/execute',
+    final uri = _buildUri(
+      '/requests/${Uri.encodeComponent(requestId)}/execute',
     );
 
     final headers = <String, String>{
@@ -343,8 +389,8 @@ class ApiService {
     String? deliveryStatus,
     String? errorMessage,
   }) async {
-    final uri = Uri.parse(
-      '$baseUrl/requests/$requestId/send-status',
+    final uri = _buildUri(
+      '/requests/${Uri.encodeComponent(requestId)}/send-status',
     );
 
     final headers = <String, String>{
@@ -427,8 +473,8 @@ class ApiService {
     String? senderAddress,
     DateTime? receivedAt,
   }) async {
-    final uri = Uri.parse(
-      '$baseUrl/requests/$requestId/result',
+    final uri = _buildUri(
+      '/requests/${Uri.encodeComponent(requestId)}/result',
     );
 
     final headers = <String, String>{

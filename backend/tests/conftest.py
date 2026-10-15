@@ -1,131 +1,133 @@
-"""Pytest Test Configuration and Fixtures."""
+"""Pytest fixtures using the real PostgreSQL test database.
 
-import copy
-from types import SimpleNamespace
-from typing import Any, Dict
+The test process is deliberately redirected to ifso_location_test before importing
+the application. The fixture refuses to run against any other database.
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+import sys
+import json
+from pathlib import Path
+from typing import Any
+
 import pytest
 import pytest_asyncio
+from sqlalchemy import text
+from sqlalchemy.engine import make_url
 from httpx import ASGITransport, AsyncClient
 
+# psycopg's async driver requires SelectorEventLoop on Windows.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+# Ensure the project root is importable.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+# Derive the test URL from the configured URL without hardcoding credentials.
+# The source URL must point to the project's known local databases.
 from backend.app.core.config import Settings, get_settings
+
+_source_settings = Settings()
+_source_url = make_url(_source_settings.database_url)
+if _source_url.database not in {"ifso_location", "ifso_location_test"}:
+    raise RuntimeError(
+        "Refusing to run tests: DATABASE_URL must target ifso_location "
+        "or ifso_location_test before test redirection."
+    )
+
+_test_url = _source_url.set(database="ifso_location_test")
+os.environ["DATABASE_URL"] = _test_url.render_as_string(hide_password=False)
+os.environ["DATABASE_NAME"] = "ifso_location_test"
+os.environ["APP_ENV"] = "testing"
+os.environ["APP_DEBUG"] = "true"
+os.environ["DEVELOPMENT_AUTH_TOKENS"] = json.dumps({
+    "test-officer-token": "OFFICER-DEV-001:OFFICER",
+    "test-io-token": "IO-DEV-001:IO",
+    "test-admin-token": "ADMIN-DEV-001:ADMIN",
+})
+get_settings.cache_clear()
+
+# Import only after DATABASE_URL has been redirected.
 from backend.app.core.database import db_manager
 from backend.app.main import create_application
 
 
 @pytest.fixture(scope="session")
 def test_settings() -> Settings:
-    """Return test settings with safe testing defaults."""
-    return Settings(
-        app_env="testing",
-        app_debug=True,
-        mongodb_database="ifso_location_test",
-        mongodb_timeout_ms=1000,
-    )
+    """Settings for tests, always targeting the dedicated test database."""
+    settings = get_settings()
+    parsed = make_url(settings.database_url)
+    if parsed.database != "ifso_location_test":
+        raise RuntimeError(
+            f"Unsafe test database {parsed.database!r}; expected 'ifso_location_test'."
+        )
+    return settings
 
 
 @pytest_asyncio.fixture
 async def async_client(test_settings: Settings) -> AsyncClient:
-    """Provide an asynchronous HTTP client wired to the FastAPI test instance."""
+    """Run FastAPI's actual startup/shutdown lifecycle for each test."""
     app = create_application()
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-        yield client
+    async with app.router.lifespan_context(app):
+        if not db_manager.is_connected:
+            raise RuntimeError(
+                "PostgreSQL test database did not connect. "
+                "Check DATABASE_URL and PostgreSQL service status."
+            )
+        async with db_manager.engine.connect() as connection:
+            row = await connection.execute(text("SELECT current_database()"))
+            actual_database = row.scalar_one()
+        if actual_database != "ifso_location_test":
+            raise RuntimeError(
+                f"Refusing tests against {actual_database!r}; "
+                "expected 'ifso_location_test'."
+            )
+        transport = ASGITransport(app=app)
+        async with AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+            yield client
 
 
-def _get_nested(document: Dict[str, Any], path: str) -> Any:
-    current: Any = document
-    for part in path.split("."):
-        if not isinstance(current, dict) or part not in current:
-            return None
-        current = current[part]
-    return current
+@pytest_asyncio.fixture
+async def postgres_database(async_client: AsyncClient):
+    """Expose the real database manager and isolate records for each test.
+
+    Depends on async_client so FastAPI startup has initialized the connection pool.
+    Deletes only rows in the dedicated test database.
+    """
+    if db_manager.engine is None or not db_manager.is_connected:
+        raise RuntimeError("PostgreSQL is not connected.")
+
+    async with db_manager.engine.begin() as connection:
+        database_name = (
+            await connection.execute(text("SELECT current_database()"))
+        ).scalar_one()
+        if database_name != "ifso_location_test":
+            raise RuntimeError("Refusing to clean a non-test database.")
+        # Delete children/audit records first. This database is reserved for tests.
+        await connection.execute(text("DELETE FROM audit_logs"))
+        await connection.execute(text("DELETE FROM location_requests"))
+        await connection.execute(text("DELETE FROM operators"))
+
+    yield db_manager
+
+    if db_manager.engine is not None and db_manager.is_connected:
+        async with db_manager.engine.begin() as connection:
+            database_name = (
+                await connection.execute(text("SELECT current_database()"))
+            ).scalar_one()
+            if database_name != "ifso_location_test":
+                raise RuntimeError("Refusing cleanup against a non-test database.")
+            await connection.execute(text("DELETE FROM audit_logs"))
+            await connection.execute(text("DELETE FROM location_requests"))
+            await connection.execute(text("DELETE FROM operators"))
 
 
-def _set_nested(document: Dict[str, Any], path: str, value: Any) -> None:
-    current = document
-    parts = path.split(".")
-    for part in parts[:-1]:
-        if part not in current or not isinstance(current[part], dict):
-            current[part] = {}
-        current = current[part]
-    current[parts[-1]] = value
-
-
-def _matches(document: Dict[str, Any], query: Dict[str, Any]) -> bool:
-    for key, expected in query.items():
-        if _get_nested(document, key) != expected:
-            return False
-    return True
-
-class FakeCursor:
-    def __init__(self, documents: list[Dict[str, Any]]) -> None:
-        self.documents = documents
-
-    def sort(self, key: str, direction: int):
-        self.documents.sort(
-            key=lambda document: document.get(key) or "",
-            reverse=direction < 0,
-        )
-        return self
-
-    def __aiter__(self):
-        async def iterate():
-            for document in self.documents:
-                yield copy.deepcopy(document)
-
-        return iterate()
-
-class FakeCollection:
-    def __init__(self) -> None:
-        self.documents: list[Dict[str, Any]] = []
-
-    async def insert_one(self, document: Dict[str, Any]):
-        self.documents.append(copy.deepcopy(document))
-        return SimpleNamespace(inserted_id=len(self.documents))
-
-    async def find_one(
-        self,
-        query: Dict[str, Any],
-        projection: Dict[str, int] | None = None,
-    ):
-        for document in self.documents:
-            if _matches(document, query):
-                return copy.deepcopy(document)
-        return None
-
-    def find(self, query: Dict[str, Any]) -> FakeCursor:
-        matching_documents = [
-            copy.deepcopy(document)
-            for document in self.documents
-            if _matches(document, query)
-        ]
-        return FakeCursor(matching_documents)
-
-    async def update_one(
-        self,
-        query: Dict[str, Any],
-        update: Dict[str, Any],
-    ):
-        for document in self.documents:
-            if _matches(document, query):
-                for key, value in update.get("$set", {}).items():
-                    _set_nested(document, key, value)
-                return SimpleNamespace(modified_count=1)
-        return SimpleNamespace(modified_count=0)
-
-
-class FakeDatabase:
-    def __init__(self) -> None:
-        self.location_requests = FakeCollection()
-        self.operators = FakeCollection()
-        self.audit_logs = FakeCollection()
-
-    def __getitem__(self, name: str):
-        return getattr(self, name)
-
-
-@pytest.fixture
-def fake_database(monkeypatch: pytest.MonkeyPatch) -> FakeDatabase:
-    fake_db = FakeDatabase()
-    monkeypatch.setattr(db_manager, "get_database", lambda: fake_db)
-    return fake_db
+async def fetch_all_documents(collection) -> list[dict[str, Any]]:
+    """Read all persisted payloads from a real PostgresCollection."""
+    return await collection._find({}, None)

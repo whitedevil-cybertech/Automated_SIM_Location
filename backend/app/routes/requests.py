@@ -14,6 +14,7 @@ from backend.app.core.auth import (
 )
 from backend.app.core.config import get_settings
 from backend.app.core.database import db_manager
+from backend.app.core.field_crypto import decrypt_sensitive_text, encrypt_sensitive_text
 from backend.app.core.exceptions import (
     InvalidStateTransitionError,
     ResourceNotFoundError,
@@ -65,6 +66,28 @@ def _to_response(
         remarks=document.remarks,
         shareable_link=shareable_link,
         has_parsed_result=document.parsed_result is not None,
+        raw_sms_content=(
+            (
+                document.response_info.raw_sms_content
+                if document.response_info.raw_sms_content is not None
+                else decrypt_sensitive_text(document.response_info.raw_sms_content_encrypted)
+                if document.response_info.raw_sms_content_encrypted is not None
+                else None
+            )
+            if document.response_info is not None else None
+        ),
+        response_sender_address=(
+            document.response_info.sender_address
+            if document.response_info is not None else None
+        ),
+        response_received_at=(
+            document.response_info.received_at
+            if document.response_info is not None else None
+        ),
+        response_sha256=(
+            document.response_info.raw_hash_sha256
+            if document.response_info is not None else None
+        ),
     )
 
 
@@ -73,18 +96,19 @@ async def _is_operator_active(operator_code: str) -> bool:
     if db_operator is not None:
         return bool(db_operator.get("is_active", False))
 
-    return any(
-        op.operator_code == operator_code and op.is_active for op in DEMO_OPERATORS
-    )
+    settings = get_settings()
+    # Synthetic operator choices exist only in local development/testing. They
+    # are not trusted configuration and can never authorize production requests.
+    if settings.app_env in {"development", "testing"}:
+        return any(
+            op.operator_code == operator_code and op.is_active for op in DEMO_OPERATORS
+        )
+    return False
 
 
-# Approved development/test carrier dispatch profiles (Rules.md / PRD.md)
-DEFAULT_OPERATOR_CONFIGS = {
-    "JIO": {"service_number": "1512", "sms_template": "LOC {number}"},
-    "AIRTEL": {"service_number": "1513", "sms_template": "LOC {number}"},
-    "VI": {"service_number": "1514", "sms_template": "LOC {number}"},
-    "BSNL": {"service_number": "1515", "sms_template": "LOC {number}"},
-}
+# Telecom dispatch values are intentionally not guessed. An operator must have
+# an explicitly approved service number and SMS template in PostgreSQL before
+# the execution endpoint can return dispatch instructions.
 
 
 def _format_sms_template(template: str, normalized_phone: str) -> str:
@@ -99,21 +123,40 @@ def _format_sms_template(template: str, normalized_phone: str) -> str:
 
 
 async def _get_operator_dispatch_config(operator_code: str) -> dict:
-    """Retrieve approved carrier dispatch configuration from database or approved fallback."""
+    """Load an approved operator profile; fail closed when integration data is absent."""
     db_operator = await db_manager.operators.find_one({"operator_code": operator_code})
-    service_number = None
-    sms_template = None
-    if db_operator is not None:
-        service_number = db_operator.get("service_number")
-        sms_template = db_operator.get("sms_template")
+    if not db_operator:
+        raise ValidationException(
+            message="No approved SMS configuration exists for this operator.",
+            field="operator_code",
+            details={"operator_code": operator_code, "configuration_required": True},
+        )
 
-    fallback = DEFAULT_OPERATOR_CONFIGS.get(
-        operator_code,
-        {"service_number": "1512", "sms_template": "LOC {number}"},
-    )
+    service_number = db_operator.get("service_number")
+    sms_template = db_operator.get("sms_template")
+    if not isinstance(service_number, str) or not service_number.strip():
+        raise ValidationException(
+            message="The operator profile has no approved SMS destination.",
+            field="operator_code",
+            details={"operator_code": operator_code, "configuration_required": True},
+        )
+    if not isinstance(sms_template, str) or not sms_template.strip():
+        raise ValidationException(
+            message="The operator profile has no approved SMS template.",
+            field="operator_code",
+            details={"operator_code": operator_code, "configuration_required": True},
+        )
+    response_sender = db_operator.get("response_sender")
+    if not isinstance(response_sender, str) or not response_sender.strip():
+        raise ValidationException(
+            message="The operator profile has no approved response sender for SMS correlation.",
+            field="operator_code",
+            details={"operator_code": operator_code, "configuration_required": True},
+        )
     return {
-        "service_number": service_number or fallback["service_number"],
-        "sms_template": sms_template or fallback["sms_template"],
+        "service_number": service_number.strip(),
+        "sms_template": sms_template.strip(),
+        "response_sender": response_sender.strip(),
     }
 
 
@@ -213,16 +256,24 @@ async def get_pending_io_requests(
     """Return location requests awaiting IO review."""
     require_role(principal, UserRole.IO, UserRole.ADMIN)
 
-    cursor = db_manager.location_requests.find(
-        {"status": RequestState.PENDING_IO_REVIEW.value}
-    ).sort("created_at", -1)
-
+    # Include requests explicitly shared with the IO even if the IO has not
+    # opened/redeemed the one-time link yet. Unshared CREATED requests remain
+    # invisible to the IO queue. Once redeemed, the state is PENDING_IO_REVIEW.
+    cursor = db_manager.location_requests.find({}).sort("created_at", -1)
     documents: list[LocationRequestResponse] = []
 
     async for data in cursor:
         data.pop("_id", None)
         document = LocationRequestDocument.model_validate(data)
-        documents.append(_to_response(document))
+        is_pending = document.status == RequestState.PENDING_IO_REVIEW
+        is_shared_created = (
+            document.status == RequestState.CREATED
+            and document.share_token is not None
+            and not document.share_token.is_used
+            and document.share_token.expires_at > datetime.now(timezone.utc)
+        )
+        if is_pending or is_shared_created:
+            documents.append(_to_response(document))
 
     return ApiResponse(
         success=True,
@@ -303,12 +354,32 @@ async def mint_share_link(
         {
             "$set": {
                 "share_token": share_token.model_dump(mode="json"),
+                "status": (
+                    RequestState.PENDING_IO_REVIEW.value
+                    if document.status == RequestState.CREATED
+                    else document.status.value
+                ),
                 "updated_at": now,
             }
         },
     )
     if update_result.modified_count != 1:
         raise ResourceNotFoundError(message="Location request not found.")
+
+    await _write_audit_event(
+        request_id=document.request_id,
+        actor_id=principal.principal_id,
+        actor_role=principal.role,
+        event_type=AuditEventType.SHAREABLE_LINK_CREATED,
+        details={
+            "status": (
+                RequestState.PENDING_IO_REVIEW.value
+                if document.status == RequestState.CREATED
+                else document.status.value
+            ),
+            "expires_at": share_token.expires_at.isoformat(),
+        },
+    )
 
     refreshed = await db_manager.location_requests.find_one(
         {"request_id": document.request_id}
@@ -375,6 +446,7 @@ async def execute_request(
         "sms_body": sms_body,
         "operator_code": document.operator_code,
         "sim_slot_index": sim_slot_index,
+        "response_sender": operator_config.get("response_sender"),
     }
 
     now = datetime.now(timezone.utc)
@@ -386,7 +458,7 @@ async def execute_request(
                 "executing_io_id": principal.principal_id,
                 "execution_info.io_device_id": payload.io_device_id,
                 "execution_info.sim_slot_index": sim_slot_index,
-                "execution_info.dispatched_at": now,
+                "execution_info.execution_started_at": now,
                 "updated_at": now,
             }
         },
@@ -462,6 +534,48 @@ async def record_send_status(
         else RequestState.SMS_FAILED
     )
 
+    # Make retries safe when the database update committed but the HTTP
+    # response was lost. This does not repeat the mutation or duplicate audit
+    # events, and it never moves a request backwards from a later lifecycle state.
+    expected_delivery_status = payload.delivery_status or "SENT"
+    if payload.success:
+        already_recorded_success = (
+            document.status in {
+                RequestState.WAITING_RESPONSE,
+                RequestState.COMPLETED,
+                RequestState.TIMEOUT,
+                RequestState.RESPONSE_INVALID,
+            }
+            and document.execution_info.delivery_status == expected_delivery_status
+        )
+        if already_recorded_success:
+            return ApiResponse(
+                success=True,
+                message="SMS dispatch status was already recorded.",
+                data={
+                    "request_id": request_id,
+                    "status": document.status.value,
+                    "updated_at": document.updated_at,
+                    "idempotent_replay": True,
+                },
+            )
+    else:
+        expected_error = payload.error_message or "SMS transmission failed"
+        if (
+            document.status == RequestState.SMS_FAILED
+            and document.execution_info.last_error == expected_error
+        ):
+            return ApiResponse(
+                success=True,
+                message="SMS failure status was already recorded.",
+                data={
+                    "request_id": request_id,
+                    "status": document.status.value,
+                    "updated_at": document.updated_at,
+                    "idempotent_replay": True,
+                },
+            )
+
     if not is_valid_transition(document.status, target_state):
         raise InvalidStateTransitionError(
             current_state=document.status.value,
@@ -478,6 +592,9 @@ async def record_send_status(
         update_fields["execution_info.delivery_status"] = (
             payload.delivery_status or "SENT"
         )
+        # Start the response deadline only after the device reports dispatch.
+        update_fields["execution_info.dispatched_at"] = now
+        update_fields["execution_info.awaiting_response_since"] = now
     else:
         update_fields["execution_info.last_error"] = (
             payload.error_message or "SMS transmission failed"
@@ -553,6 +670,21 @@ async def submit_result(
     data.pop("_id", None)
     document = LocationRequestDocument.model_validate(data)
 
+    # Validate the claimed sender against the provider-approved profile before
+    # accepting raw SMS as evidence. Do not infer a sender from the destination.
+    operator_config = await _get_operator_dispatch_config(document.operator_code)
+    expected_sender = operator_config["response_sender"]
+    received_sender = (payload.sender_address or "").strip()
+    normalize_sender = lambda value: "".join(
+        char for char in value.upper() if char.isalnum()
+    )
+    if not received_sender or normalize_sender(received_sender) != normalize_sender(expected_sender):
+        raise ValidationException(
+            message="SMS sender does not match the approved operator response sender.",
+            field="sender_address",
+            details={"operator_code": document.operator_code},
+        )
+
     if not is_valid_transition(document.status, RequestState.COMPLETED):
         raise InvalidStateTransitionError(
             current_state=document.status.value,
@@ -564,7 +696,8 @@ async def submit_result(
     raw_hash = hashlib.sha256(payload.raw_sms_content.encode("utf-8")).hexdigest()
 
     response_info = ResponseInfo(
-        raw_sms_content=payload.raw_sms_content,
+        raw_sms_content=None,
+        raw_sms_content_encrypted=encrypt_sensitive_text(payload.raw_sms_content),
         sender_address=payload.sender_address,
         received_at=received_at,
         raw_hash_sha256=raw_hash,
@@ -619,4 +752,3 @@ async def submit_result(
             "received_at": received_at,
         },
     )
-

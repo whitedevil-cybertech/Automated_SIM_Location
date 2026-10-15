@@ -12,7 +12,7 @@ from backend.app.models.location_request import (
     ShareTokenInfo,
 )
 
-IO_AUTH = {"Authorization": "Bearer dev-io-token"}
+IO_AUTH = {"Authorization": "Bearer test-io-token"}
 
 VALID_TOKEN = "test-share-token-12345678901234567890"
 
@@ -47,35 +47,33 @@ def create_request(
     return request
 
 
-def seed_request(fake_database, request: LocationRequestDocument) -> None:
-    """Insert a request into the in-memory test database."""
-    fake_database.location_requests.documents.append(
+async def seed_request(postgres_database, request: LocationRequestDocument) -> None:
+    """Persist a request using the real PostgreSQL adapter."""
+    await postgres_database.location_requests.insert_one(
         request.model_dump(mode="json")
     )
 
 
-def audit_event_types(fake_database) -> list[str]:
-    """Return the event types recorded in the audit collection."""
+async def audit_event_types(postgres_database) -> list[str]:
+    """Return event types persisted in PostgreSQL."""
+    from backend.tests.conftest import fetch_all_documents
+
     events = []
-
-    for document in fake_database.audit_logs.documents:
+    for document in await fetch_all_documents(postgres_database.audit_logs):
         event_type = document["event_type"]
-
         if hasattr(event_type, "value"):
             event_type = event_type.value
-
         events.append(str(event_type))
-
     return events
 
 
 @pytest.mark.asyncio
 async def test_valid_link_moves_created_request_to_io_review(
     async_client,
-    fake_database,
+    postgres_database,
 ):
     request = create_request()
-    seed_request(fake_database, request)
+    await seed_request(postgres_database, request)
 
     response = await async_client.get(
         f"/api/v1/request-links/{VALID_TOKEN}",
@@ -89,7 +87,7 @@ async def test_valid_link_moves_created_request_to_io_review(
     assert body["data"]["request_id"] == request.request_id
     assert body["data"]["status"] == RequestState.PENDING_IO_REVIEW.value
 
-    stored = await fake_database.location_requests.find_one(
+    stored = await postgres_database.location_requests.find_one(
         {"request_id": request.request_id}
     )
 
@@ -97,7 +95,7 @@ async def test_valid_link_moves_created_request_to_io_review(
     assert stored["share_token"]["is_used"] is True
     assert stored["share_token"]["used_at"] is not None
 
-    events = audit_event_types(fake_database)
+    events = await audit_event_types(postgres_database)
 
     assert AuditEventType.SHAREABLE_LINK_ACCESSED.value in events
     assert AuditEventType.IO_REVIEW_STARTED.value in events
@@ -106,10 +104,10 @@ async def test_valid_link_moves_created_request_to_io_review(
 @pytest.mark.asyncio
 async def test_share_link_cannot_be_redeemed_twice(
     async_client,
-    fake_database,
+    postgres_database,
 ):
     request = create_request()
-    seed_request(fake_database, request)
+    await seed_request(postgres_database, request)
 
     first_response = await async_client.get(
         f"/api/v1/request-links/{VALID_TOKEN}",
@@ -125,14 +123,14 @@ async def test_share_link_cannot_be_redeemed_twice(
 
     assert second_response.status_code == 404
 
-    stored = await fake_database.location_requests.find_one(
+    stored = await postgres_database.location_requests.find_one(
         {"request_id": request.request_id}
     )
 
     assert stored["share_token"]["is_used"] is True
 
     # Only the first redemption should have generated audit events.
-    events = audit_event_types(fake_database)
+    events = await audit_event_types(postgres_database)
 
     assert events.count(AuditEventType.SHAREABLE_LINK_ACCESSED.value) == 1
     assert events.count(AuditEventType.IO_REVIEW_STARTED.value) == 1
@@ -141,7 +139,7 @@ async def test_share_link_cannot_be_redeemed_twice(
 @pytest.mark.asyncio
 async def test_expired_share_link_is_rejected(
     async_client,
-    fake_database,
+    postgres_database,
 ):
     expired_token = "expired-share-token-123456789012"
     request = create_request(
@@ -149,7 +147,7 @@ async def test_expired_share_link_is_rejected(
         token=expired_token,
         expires_at=datetime.now(timezone.utc) - timedelta(minutes=5),
     )
-    seed_request(fake_database, request)
+    await seed_request(postgres_database, request)
 
     response = await async_client.get(
         f"/api/v1/request-links/{expired_token}",
@@ -158,22 +156,22 @@ async def test_expired_share_link_is_rejected(
 
     assert response.status_code == 404
 
-    stored = await fake_database.location_requests.find_one(
+    stored = await postgres_database.location_requests.find_one(
         {"request_id": request.request_id}
     )
 
     assert stored["status"] == RequestState.CREATED.value
     assert stored["share_token"]["is_used"] is False
-    assert fake_database.audit_logs.documents == []
+    assert await postgres_database.audit_logs._find({}, None) == []
 
 
 @pytest.mark.asyncio
 async def test_invalid_share_token_is_rejected(
     async_client,
-    fake_database,
+    postgres_database,
 ):
     request = create_request()
-    seed_request(fake_database, request)
+    await seed_request(postgres_database, request)
 
     invalid_token = "invalid-share-token-123456789012"
 
@@ -184,19 +182,19 @@ async def test_invalid_share_token_is_rejected(
 
     assert response.status_code == 404
 
-    stored = await fake_database.location_requests.find_one(
+    stored = await postgres_database.location_requests.find_one(
         {"request_id": request.request_id}
     )
 
     assert stored["status"] == RequestState.CREATED.value
     assert stored["share_token"]["is_used"] is False
-    assert fake_database.audit_logs.documents == []
+    assert await postgres_database.audit_logs._find({}, None) == []
 
 
 @pytest.mark.asyncio
 async def test_accessing_link_does_not_reset_existing_request_state(
     async_client,
-    fake_database,
+    postgres_database,
 ):
     token = "reviewed-share-token-123456789012"
     request = create_request(
@@ -204,7 +202,7 @@ async def test_accessing_link_does_not_reset_existing_request_state(
         status=RequestState.PENDING_IO_REVIEW,
         token=token,
     )
-    seed_request(fake_database, request)
+    await seed_request(postgres_database, request)
 
     response = await async_client.get(
         f"/api/v1/request-links/{token}",
@@ -216,14 +214,14 @@ async def test_accessing_link_does_not_reset_existing_request_state(
         RequestState.PENDING_IO_REVIEW.value
     )
 
-    stored = await fake_database.location_requests.find_one(
+    stored = await postgres_database.location_requests.find_one(
         {"request_id": request.request_id}
     )
 
     assert stored["status"] == RequestState.PENDING_IO_REVIEW.value
     assert stored["share_token"]["is_used"] is True
 
-    events = audit_event_types(fake_database)
+    events = await audit_event_types(postgres_database)
 
     assert events.count(AuditEventType.SHAREABLE_LINK_ACCESSED.value) == 1
     assert AuditEventType.IO_REVIEW_STARTED.value not in events

@@ -1,49 +1,26 @@
 """Phase 2 request management API tests."""
 
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
-from typing import Any, Dict
-import copy
 import re
 import pytest
 
-from backend.app.core.database import db_manager
 from backend.app.models.location_request import LocationRequestDocument
-from backend.tests.conftest import FakeDatabase
+from backend.tests.conftest import fetch_all_documents
 
 
-OFFICER_AUTH = {"Authorization": "Bearer dev-officer-token"}
-IO_AUTH = {"Authorization": "Bearer dev-io-token"}
-ADMIN_AUTH = {"Authorization": "Bearer dev-admin-token"}
+OFFICER_AUTH = {"Authorization": "Bearer test-officer-token"}
+IO_AUTH = {"Authorization": "Bearer test-io-token"}
+ADMIN_AUTH = {"Authorization": "Bearer test-admin-token"}
 
 
-def _get_nested(document: Dict[str, Any], path: str) -> Any:
-    current: Any = document
-    for part in path.split("."):
-        if not isinstance(current, dict) or part not in current:
-            return None
-        current = current[part]
-    return current
-
-
-def _set_nested(document: Dict[str, Any], path: str, value: Any) -> None:
-    current = document
-    parts = path.split(".")
-    for part in parts[:-1]:
-        if part not in current or not isinstance(current[part], dict):
-            current[part] = {}
-        current = current[part]
-    current[parts[-1]] = value
-
-
-def _matches(document: Dict[str, Any], query: Dict[str, Any]) -> bool:
-    for key, expected in query.items():
-        if _get_nested(document, key) != expected:
-            return False
-    return True
-
-async def _create_pending_request(async_client, fake_database) -> str:
-    await fake_database.operators.insert_one({"operator_code": "JIO", "is_active": True})
+async def _create_pending_request(async_client, postgres_database) -> str:
+    await postgres_database.operators.insert_one({
+        "operator_code": "JIO",
+        "is_active": True,
+        "service_number": "TEST-SERVICE-NUMBER",
+        "sms_template": "TEST-COMMAND {number}",
+        "response_sender": "TEST-RESPONSE-SENDER",
+    })
     create_response = await async_client.post(
         "/api/v1/requests",
         json={
@@ -65,8 +42,14 @@ async def _create_pending_request(async_client, fake_database) -> str:
 
 
 @pytest.mark.asyncio
-async def test_create_request_success_and_persistence(async_client, fake_database: FakeDatabase):
-    await fake_database.operators.insert_one({"operator_code": "JIO", "is_active": True})
+async def test_create_request_success_and_persistence(async_client, postgres_database):
+    await postgres_database.operators.insert_one({
+        "operator_code": "JIO",
+        "is_active": True,
+        "service_number": "TEST-SERVICE-NUMBER",
+        "sms_template": "TEST-COMMAND {number}",
+        "response_sender": "TEST-RESPONSE-SENDER",
+    })
 
     response = await async_client.post(
         "/api/v1/requests",
@@ -89,7 +72,9 @@ async def test_create_request_success_and_persistence(async_client, fake_databas
     assert "+919876543210" not in str(data)
     assert data["shareable_link"] is None
 
-    stored = fake_database.location_requests.documents[0]
+    stored = await postgres_database.location_requests.find_one(
+        {"request_id": data["request_id"]}
+    )
     assert "target_phone_number" not in stored
     assert stored["target_phone_encrypted"] != "+919876543210"
     assert "+919876543210" not in str(stored)
@@ -97,13 +82,20 @@ async def test_create_request_success_and_persistence(async_client, fake_databas
     assert stored_document.decrypt_target_phone_number() == "+919876543210"
     assert stored["status"] == "CREATED"
     assert stored["share_token"] is None
-    assert len(fake_database.audit_logs.documents) == 1
-    assert fake_database.audit_logs.documents[0]["event_type"] == "REQUEST_CREATED"
+    audits = await fetch_all_documents(postgres_database.audit_logs)
+    created_audits = [audit for audit in audits if audit["event_type"] == "REQUEST_CREATED"]
+    assert len(created_audits) == 1
 
 
 @pytest.mark.asyncio
-async def test_create_request_invalid_phone(async_client, fake_database: FakeDatabase):
-    await fake_database.operators.insert_one({"operator_code": "JIO", "is_active": True})
+async def test_create_request_invalid_phone(async_client, postgres_database):
+    await postgres_database.operators.insert_one({
+        "operator_code": "JIO",
+        "is_active": True,
+        "service_number": "TEST-SERVICE-NUMBER",
+        "sms_template": "TEST-COMMAND {number}",
+        "response_sender": "TEST-RESPONSE-SENDER",
+    })
     response = await async_client.post(
         "/api/v1/requests",
         json={
@@ -120,8 +112,8 @@ async def test_create_request_invalid_phone(async_client, fake_database: FakeDat
 
 
 @pytest.mark.asyncio
-async def test_create_request_rejects_inactive_operator(async_client, fake_database: FakeDatabase):
-    await fake_database.operators.insert_one({"operator_code": "VI", "is_active": False})
+async def test_create_request_rejects_inactive_operator(async_client, postgres_database):
+    await postgres_database.operators.insert_one({"operator_code": "VI", "is_active": False})
     response = await async_client.post(
         "/api/v1/requests",
         json={
@@ -138,8 +130,8 @@ async def test_create_request_rejects_inactive_operator(async_client, fake_datab
 
 
 @pytest.mark.asyncio
-async def test_get_request_and_404(async_client, fake_database: FakeDatabase):
-    await fake_database.operators.insert_one({"operator_code": "AIRTEL", "is_active": True})
+async def test_get_request_and_404(async_client, postgres_database):
+    await postgres_database.operators.insert_one({"operator_code": "AIRTEL", "is_active": True})
     create_response = await async_client.post(
         "/api/v1/requests",
         json={
@@ -169,9 +161,15 @@ async def test_get_request_and_404(async_client, fake_database: FakeDatabase):
 
 @pytest.mark.asyncio
 async def test_authentication_required_invalid_token_and_no_fallback(
-    async_client, fake_database: FakeDatabase
+    async_client, postgres_database
 ):
-    await fake_database.operators.insert_one({"operator_code": "JIO", "is_active": True})
+    await postgres_database.operators.insert_one({
+        "operator_code": "JIO",
+        "is_active": True,
+        "service_number": "TEST-SERVICE-NUMBER",
+        "sms_template": "TEST-COMMAND {number}",
+        "response_sender": "TEST-RESPONSE-SENDER",
+    })
     payload = {
         "case_id": "FIR-2026-AUTH-1",
         "target_phone_number": "9876543210",
@@ -194,12 +192,12 @@ async def test_authentication_required_invalid_token_and_no_fallback(
         headers={"x-officer-id": "OFFICER-SPOOF"},
     )
     assert spoofed_header_only.status_code == 401
-    assert fake_database.location_requests.documents == []
+    assert await fetch_all_documents(postgres_database.location_requests) == []
 
 
 @pytest.mark.asyncio
 async def test_get_request_enforces_ownership_and_privileged_access(
-    async_client, fake_database: FakeDatabase
+    async_client, postgres_database
 ):
     own_document = LocationRequestDocument.create_new(
         request_id="REQ-OWNED",
@@ -215,8 +213,8 @@ async def test_get_request_enforces_ownership_and_privileged_access(
         operator_code="JIO",
         submitting_officer_id="OFFICER-OTHER",
     )
-    await fake_database.location_requests.insert_one(own_document.model_dump(mode="json"))
-    await fake_database.location_requests.insert_one(other_document.model_dump(mode="json"))
+    await postgres_database.location_requests.insert_one(own_document.model_dump(mode="json"))
+    await postgres_database.location_requests.insert_one(other_document.model_dump(mode="json"))
 
     own = await async_client.get("/api/v1/requests/REQ-OWNED", headers=OFFICER_AUTH)
     assert own.status_code == 200
@@ -233,9 +231,9 @@ async def test_get_request_enforces_ownership_and_privileged_access(
 
 @pytest.mark.asyncio
 async def test_token_access_success_replay_invalid_and_expired(
-    async_client, fake_database: FakeDatabase
+    async_client, postgres_database
 ):
-    await fake_database.operators.insert_one({"operator_code": "BSNL", "is_active": True})
+    await postgres_database.operators.insert_one({"operator_code": "BSNL", "is_active": True})
     create_response = await async_client.post(
         "/api/v1/requests",
         json={
@@ -258,7 +256,10 @@ async def test_token_access_success_replay_invalid_and_expired(
     assert "FIR-2026-REQ-5" not in shareable_link
     assert "9876543210" not in shareable_link
     assert request_id not in shareable_link
-    stored_share_token = fake_database.location_requests.documents[0]["share_token"]
+    stored_request = await postgres_database.location_requests.find_one(
+        {"request_id": request_id}
+    )
+    stored_share_token = stored_request["share_token"]
     assert "token_hash" in stored_share_token
     assert stored_share_token["token_hash"] != token
     assert "token" not in stored_share_token
@@ -272,7 +273,7 @@ async def test_token_access_success_replay_invalid_and_expired(
     assert any(
         audit["event_type"] == "SHAREABLE_LINK_ACCESSED"
         and audit["actor_id"] == "IO-DEV-001"
-        for audit in fake_database.audit_logs.documents
+        for audit in await fetch_all_documents(postgres_database.audit_logs)
     )
 
     replay = await async_client.get(f"/api/v1/request-links/{token}", headers=IO_AUTH)
@@ -300,9 +301,12 @@ async def test_token_access_success_replay_invalid_and_expired(
         headers=OFFICER_AUTH,
     )
     expired_token = expired_link_response.json()["data"]["shareable_link"].rsplit("/", 1)[-1]
-    fake_database.location_requests.documents[-1]["share_token"]["expires_at"] = datetime.now(
-        timezone.utc
-    ) - timedelta(hours=1)
+    await postgres_database.location_requests.update_one(
+        {"request_id": expired_request_id},
+        {"$set": {
+            "share_token.expires_at": datetime.now(timezone.utc) - timedelta(hours=1)
+        }},
+    )
     expired_access = await async_client.get(
         f"/api/v1/request-links/{expired_token}", headers=IO_AUTH
     )
@@ -310,8 +314,8 @@ async def test_token_access_success_replay_invalid_and_expired(
 
 
 @pytest.mark.asyncio
-async def test_share_link_requires_io_auth(async_client, fake_database: FakeDatabase):
-    await fake_database.operators.insert_one({"operator_code": "BSNL", "is_active": True})
+async def test_share_link_requires_io_auth(async_client, postgres_database):
+    await postgres_database.operators.insert_one({"operator_code": "BSNL", "is_active": True})
     create_response = await async_client.post(
         "/api/v1/requests",
         json={
@@ -339,9 +343,9 @@ async def test_share_link_requires_io_auth(async_client, fake_database: FakeData
 
 @pytest.mark.asyncio
 async def test_execute_request_success_persists_metadata_and_audit(
-    async_client, fake_database: FakeDatabase
+    async_client, postgres_database
 ):
-    request_id = await _create_pending_request(async_client, fake_database)
+    request_id = await _create_pending_request(async_client, postgres_database)
 
     execute_response = await async_client.post(
         f"/api/v1/requests/{request_id}/execute",
@@ -356,10 +360,8 @@ async def test_execute_request_success_persists_metadata_and_audit(
     assert payload["data"]["io_device_id"] == "MDM-DEVICE-01"
     assert payload["data"]["sim_slot_index"] == 1
 
-    stored = next(
-        doc
-        for doc in fake_database.location_requests.documents
-        if doc["request_id"] == request_id
+    stored = await postgres_database.location_requests.find_one(
+        {"request_id": request_id}
     )
     assert stored["status"] == "EXECUTING"
     assert stored["executing_io_id"] == "IO-DEV-001"
@@ -371,13 +373,13 @@ async def test_execute_request_success_persists_metadata_and_audit(
         audit["event_type"] == "EXECUTION_TRIGGERED"
         and audit["request_id"] == request_id
         and audit["actor_id"] == "IO-DEV-001"
-        for audit in fake_database.audit_logs.documents
+        for audit in await fetch_all_documents(postgres_database.audit_logs)
     )
 
 
 @pytest.mark.asyncio
-async def test_execute_request_denies_officer(async_client, fake_database: FakeDatabase):
-    request_id = await _create_pending_request(async_client, fake_database)
+async def test_execute_request_denies_officer(async_client, postgres_database):
+    request_id = await _create_pending_request(async_client, postgres_database)
     response = await async_client.post(
         f"/api/v1/requests/{request_id}/execute",
         json={"io_device_id": "MDM-DEVICE-02", "sim_slot_index": 0},
@@ -388,8 +390,8 @@ async def test_execute_request_denies_officer(async_client, fake_database: FakeD
 
 
 @pytest.mark.asyncio
-async def test_execute_request_denies_unauthenticated(async_client, fake_database: FakeDatabase):
-    request_id = await _create_pending_request(async_client, fake_database)
+async def test_execute_request_denies_unauthenticated(async_client, postgres_database):
+    request_id = await _create_pending_request(async_client, postgres_database)
     response = await async_client.post(
         f"/api/v1/requests/{request_id}/execute",
         json={"io_device_id": "MDM-DEVICE-03", "sim_slot_index": 0},
@@ -399,8 +401,14 @@ async def test_execute_request_denies_unauthenticated(async_client, fake_databas
 
 
 @pytest.mark.asyncio
-async def test_execute_request_rejects_wrong_state(async_client, fake_database: FakeDatabase):
-    await fake_database.operators.insert_one({"operator_code": "JIO", "is_active": True})
+async def test_execute_request_rejects_wrong_state(async_client, postgres_database):
+    await postgres_database.operators.insert_one({
+        "operator_code": "JIO",
+        "is_active": True,
+        "service_number": "TEST-SERVICE-NUMBER",
+        "sms_template": "TEST-COMMAND {number}",
+        "response_sender": "TEST-RESPONSE-SENDER",
+    })
     create_response = await async_client.post(
         "/api/v1/requests",
         json={

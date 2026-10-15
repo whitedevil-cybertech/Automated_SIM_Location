@@ -5,6 +5,7 @@ exception handlers, and API routing.
 """
 
 from contextlib import asynccontextmanager
+import asyncio
 from typing import AsyncGenerator
 from fastapi import FastAPI, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,6 +16,7 @@ from backend.app.core.database import db_manager
 from backend.app.core.exceptions import register_exception_handlers
 from backend.app.core.logging import get_logger, setup_logging
 from backend.app.routes.api import api_v1_router
+from backend.app.services.request_timeouts import timeout_worker
 
 logger = get_logger("app.main")
 
@@ -31,14 +33,23 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         f"in '{settings.app_env}' environment (debug={settings.app_debug})."
     )
 
-    # Attempt database connection
+    # Attempt database connection. The timeout worker remains idle if the DB is
+    # unavailable and retries on subsequent polling intervals.
     await db_manager.connect(settings)
+    stop_timeout_worker = asyncio.Event()
+    timeout_task = asyncio.create_task(timeout_worker(stop_timeout_worker), name="request-timeout-worker")
 
-    yield
-
-    # Teardown database connection pool
-    logger.info("Initiating graceful shutdown...")
-    await db_manager.close()
+    try:
+        yield
+    finally:
+        logger.info("Initiating graceful shutdown...")
+        stop_timeout_worker.set()
+        timeout_task.cancel()
+        try:
+            await timeout_task
+        except asyncio.CancelledError:
+            pass
+        await db_manager.close()
     logger.info("Application shutdown complete.")
 
 
@@ -61,13 +72,14 @@ def create_application() -> FastAPI:
     )
 
     # CORS configuration for development and mobile clients
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    if settings.cors_allowed_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.cors_allowed_origins,
+            allow_credentials=False,
+            allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
+            allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+        )
 
     # Register centralized exception handlers
     register_exception_handlers(app)

@@ -10,6 +10,7 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
 import android.telephony.SmsManager
+import android.telephony.SubscriptionManager
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
@@ -61,6 +62,19 @@ class MainActivity : FlutterActivity() {
                 "checkSmsPermission" -> handleCheckPermission(result)
                 "requestSmsPermission" -> handleRequestPermission(result)
                 "sendSms" -> handleSendSms(call, result)
+                "shareText" -> {
+                    val text = call.argument<String>("text").orEmpty()
+                    if (text.isBlank()) {
+                        result.success(false)
+                    } else {
+                        val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                            type = "text/plain"
+                            putExtra(Intent.EXTRA_TEXT, text)
+                        }
+                        startActivity(Intent.createChooser(sendIntent, "Share authorized result"))
+                        result.success(true)
+                    }
+                }
                 else -> result.notImplemented()
             }
         }
@@ -159,12 +173,28 @@ class MainActivity : FlutterActivity() {
         }
 
         try {
-            val smsManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                getSystemService(SmsManager::class.java) ?: SmsManager.getDefault()
-            } else {
-                @Suppress("DEPRECATION")
-                SmsManager.getDefault()
+            val subscriptionManager = getSystemService(SubscriptionManager::class.java)
+            val selectedSubscription = subscriptionManager
+                ?.activeSubscriptionInfoList
+                ?.firstOrNull { it.simSlotIndex == simSlotIndex }
+
+            if (selectedSubscription == null) {
+                result.success(
+                    mapOf(
+                        "success" to false,
+                        "errorCode" to "SIM_NOT_AVAILABLE",
+                        "errorMessage" to "No active SIM is available in the selected slot."
+                    )
+                )
+                return
             }
+
+            // Never silently fall back to the device default SIM: the selected
+            // authorized SIM slot must match the request execution context.
+            @Suppress("DEPRECATION")
+            val smsManager = SmsManager.getSmsManagerForSubscriptionId(
+                selectedSubscription.subscriptionId
+            )
 
             val sentAction = "gov.ifso.location_requests.SMS_SENT_${System.currentTimeMillis()}"
             val sentIntent = Intent(sentAction)

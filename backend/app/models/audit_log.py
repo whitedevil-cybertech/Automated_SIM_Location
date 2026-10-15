@@ -1,4 +1,4 @@
-"""Audit Log Document Model for MongoDB.
+"""Audit Log JSONB payload model for PostgreSQL.
 
 Ensures tamper-evident chain-of-custody logging for all actions and transitions
 across the request lifecycle.
@@ -13,7 +13,7 @@ from backend.app.models.enums import AuditEventType, UserRole
 
 
 class AuditLogDocument(BaseModel):
-    """MongoDB Document Model for the 'audit_logs' collection."""
+    """PostgreSQL JSONB payload model for the 'audit_logs' collection."""
 
     audit_id: str = Field(
         default_factory=lambda: f"AUD-{uuid.uuid4().hex[:12].upper()}",

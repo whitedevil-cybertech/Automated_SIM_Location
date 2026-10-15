@@ -257,3 +257,45 @@ The project strictly follows the forensic, legal, and operational rules defined 
 1. **Authentication/Authorization:** Production auth is not implemented yet. Phase 2 now requires bearer authentication, but the bundled static-token authenticator is development/testing only. Production requires an external identity provider integration before deployment.
 2. **Operator Source in Development:** If operator records are not present in MongoDB, request creation falls back to the existing synthetic approved operator profiles used by `/api/v1/operators`.
 3. **Phase Boundary:** Phase 3A backend authorization and Phase 3B Flutter IO Review/API integration are implemented. Android SMS dispatch, SIM discovery, Kotlin `SmsManager`, and response ingestion remain Phase 3C/Phase 4 work.
+
+# PostgreSQL-only pytest migration
+
+## Files in this patch
+
+Replace these files in the project with the matching paths in this archive:
+
+- `backend/tests/conftest.py`
+- `backend/tests/test_requests_io_pending.py`
+- `backend/tests/test_requests_phase2.py`
+- `backend/tests/test_requests_phase3.py`
+- `backend/tests/test_request_links.py`
+
+Add:
+
+- `backend/tests/test_postgres_persistence.py`
+
+The fake classes and `fake_database` fixture are removed. Tests now seed and inspect records through the real `DatabaseManager` / `PostgresCollection`.
+
+## Safety behavior
+
+`conftest.py` derives the test URL from the existing `DATABASE_URL` or backend `.env`, changes only the database name to `ifso_location_test`, and sets it before importing the application. It refuses to start if the configured source database is not `ifso_location` or `ifso_location_test`.
+
+The `postgres_database` fixture verifies the connected database name before cleaning the three test tables. Do not use `ifso_location_test` for development data; it is reserved for tests.
+
+On Windows, the fixture sets `WindowsSelectorEventLoopPolicy` because the installed async Psycopg driver rejects ProactorEventLoop.
+
+## Apply and run
+
+From the project root, back up the current test files first, then copy these files into the same relative paths.
+
+Run:
+
+```powershell
+python -m pytest backend\tests -v
+```
+
+If PostgreSQL is not running or the app's configured credentials cannot access `ifso_location_test`, tests will fail at setup rather than silently run against an in-memory fake or the development database.
+
+## Important limitation
+
+The archive was syntax-compiled, but it has not been executed against the PostgreSQL server on your machine. Run the command above and address any real integration failures that appear. Do not report the suite as passing until that run completes successfully.

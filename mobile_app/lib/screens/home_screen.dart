@@ -17,6 +17,7 @@ class HomeScreen extends StatelessWidget {
     super.key,
     required this.apiService,
     required this.officerApiService,
+    required this.role,
     required this.ioDeviceId,
     this.simSlotIndex = 0,
     this.telephonyBridge,
@@ -24,6 +25,7 @@ class HomeScreen extends StatelessWidget {
 
   final ApiService apiService;
   final ApiService officerApiService;
+  final String role;
   final String ioDeviceId;
   final int simSlotIndex;
   final TelephonyBridge? telephonyBridge;
@@ -43,7 +45,7 @@ class HomeScreen extends StatelessWidget {
               ScaffoldMessenger.of(context).showSnackBar(
                 const SnackBar(
                   content: Text(
-                    'Forensic integrity active: All events audited.',
+                    'Audit events are recorded. Tamper resistance depends on database and deployment controls.',
                   ),
                 ),
               );
@@ -66,7 +68,7 @@ class HomeScreen extends StatelessWidget {
             _buildSystemStatusCard(theme),
             const SizedBox(height: AppSpacing.space4),
 
-            // Role Workflows (Phase 2 & Phase 3 placeholders)
+            // The role is resolved by /auth/me; UI visibility is not the security boundary.
             _buildRoleWorkflowSection(context, theme),
             const SizedBox(height: AppSpacing.space6),
 
@@ -103,7 +105,7 @@ class HomeScreen extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  'Phase 1 — Foundation & Architecture',
+                  'Operational MVP — Request Workflow',
                   style: theme.textTheme.titleMedium?.copyWith(
                     color: AppColors.primary,
                     fontWeight: FontWeight.w700,
@@ -111,7 +113,7 @@ class HomeScreen extends StatelessWidget {
                 ),
                 const SizedBox(height: AppSpacing.space1),
                 Text(
-                  'Core backend, database, state machine, and design system established.',
+                  'Authenticated, role-specific request workflows with audited lifecycle transitions.',
                   style: theme.textTheme.bodySmall?.copyWith(
                     color: AppColors.primary,
                   ),
@@ -143,13 +145,13 @@ class HomeScreen extends StatelessWidget {
             const SizedBox(height: AppSpacing.space2),
             _buildStatusRow(
               'Backend API',
-              'FastAPI /api/v1 (Ready)',
+              'FastAPI /api/v1 (configured)',
               Icons.cloud_done_outlined,
             ),
             const SizedBox(height: AppSpacing.space2),
             _buildStatusRow(
               'Audit Trail',
-              'Tamper-Evident Write-Once',
+              'Recorded events; DB hardening required',
               Icons.receipt_long_outlined,
             ),
           ],
@@ -183,6 +185,24 @@ class HomeScreen extends StatelessWidget {
   }
 
   Widget _buildRoleWorkflowSection(BuildContext context, ThemeData theme) {
+    if (role == 'ADMIN') {
+      return Card(
+        child: Padding(
+          padding: const EdgeInsets.all(AppSpacing.space4),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('Administrator', style: theme.textTheme.titleMedium),
+              const SizedBox(height: AppSpacing.space2),
+              const Text('Admin screens are outside the current MVP. No request execution controls are exposed for this role.'),
+            ],
+          ),
+        ),
+      );
+    }
+    if (role != 'OFFICER' && role != 'IO') {
+      return const Card(child: Padding(padding: EdgeInsets.all(16), child: Text('Unknown role. Access is denied.')));
+    }
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -190,8 +210,8 @@ class HomeScreen extends StatelessWidget {
         const SizedBox(height: AppSpacing.space2),
         Row(
           children: [
-            // Officer Module Card
-            Expanded(
+            // Render only the workflow allowed by the backend-resolved role.
+            if (role == 'OFFICER') Expanded(
               child: InkWell(
                 borderRadius: AppRadius.borderMedium,
                 onTap: () {
@@ -247,9 +267,7 @@ class HomeScreen extends StatelessWidget {
                 ),
               ),
             ),
-            const SizedBox(width: AppSpacing.space3),
-            // IO Module Card
-            Expanded(
+            if (role == 'IO') Expanded(
               child: InkWell(
                 borderRadius: AppRadius.borderMedium,
                 onTap: () {

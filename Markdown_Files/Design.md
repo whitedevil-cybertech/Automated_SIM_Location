@@ -1,154 +1,447 @@
-# Design
+Design
 
-## Color Palette & Theme
+Role-Based UI Design
 
-**Design objective:** restrained, professional, high-legibility interface optimized for operational workflows and sensitive information.
+Core Principle
 
-### Theme
+Use one Flutter application with role-based navigation and screens, rather than showing every user the same interface. After authentication, the backend-authorized role determines the available navigation, data, and actions.
 
-Use a **light-first neutral theme** with a dark theme available later if required.
+The UI must not treat a client-side role selector as an authorization boundary. The backend remains responsible for enforcing permissions on every API request. Hiding a button is not a substitute for API authorization.
+
+Roles and Their Interfaces
+
+Role
+
+Primary purpose
+
+Main navigation
+
+Allowed UI actions
+
+Officer
+
+Submit and track location requests
+
+Dashboard, New Request, My Requests, Profile
+
+Create a request, view permitted request details, check status, generate/share a review link when authorized
+
+IO
+
+Review requests assigned or made available to the IO, and process approved requests
+
+Dashboard, Pending Requests, In Progress, Completed, Profile
+
+Review request details, explicitly confirm an authorized execution, view execution status and results, record permitted remarks
+
+Admin
+
+Manage access and operational configuration, if included in the approved MVP
+
+Dashboard, Users/Roles, Operator Profiles, Audit Log, Settings
+
+Manage authorized users and configuration, review audit events; no implicit permission to execute requests unless explicitly granted
+
+Only implement the Admin interface if it is within the approved MVP scope. The Officer and IO experiences are the primary role-based flows.
+
+Authentication and Role Resolution
+
+The user signs in through the configured authentication mechanism.
+
+The backend validates the credentials/token and determines the user's role.
+
+The application loads the navigation and home screen associated with that role.
+
+Each screen requests only data permitted for that role.
+
+The backend independently enforces role and resource-level access for every operation.
+
+If the role is missing, unknown, or the session is unauthorized, show a clear access/session error; do not default to a privileged screen.
+
+Do not hard-code production user identities or role assignments into the mobile app. Development-only tokens may be used for local testing, but must not be shipped as production credentials.
+
+Officer UI
+
+Dashboard
+
+Summary counts for the Officer's requests by state.
+
+Primary action: New Location Request.
+
+Recent requests with masked target number, case reference, operator, timestamp, and current status.
+
+New Request
+
+Case reference, target phone number, operator, and optional remarks.
+
+Validate input before submission and show field-level errors.
+
+Disable repeated submission while the request is in progress.
+
+Show success only after the backend confirms creation; if the outcome is uncertain, clearly explain that status must be checked before retrying.
+
+Request Details
+
+Request ID, masked target, operator, creator, timestamps, current state, and audit history as permitted.
+
+Show a share-link action only when the backend confirms the user is allowed to create one.
+
+Do not display the IO's execution controls in the Officer interface.
+
+IO UI
+
+Dashboard
+
+Counts for pending review, in-progress, completed, and failed/timed-out requests, limited to data the IO is authorized to access.
+
+Highlight pending requests without using color alone.
+
+Pending Requests
+
+List request ID, case reference, masked target number, operator, submitting Officer, creation time, and status.
+
+Include loading, empty, refresh, offline, and API-error states.
+
+Tapping a row opens review details; opening a link must never automatically execute a location request.
+
+Request Review and Execution
+
+Show the request details and available authorization/context before any consequential action.
+
+Use an explicit action label such as Execute Authorized Location Request, followed by a confirmation step.
+
+Display the execution state and timestamps after the backend accepts the action.
+
+Show SMS send/receive and parsing outcomes distinctly; do not mark a request completed until the backend confirms the accepted result.
+
+If SMS integration is unavailable or permission is denied, explain the issue and provide a safe recovery path rather than implying success.
+
+Completed / Failed Requests
+
+Display the final state, event timeline, and result only where authorized.
+
+Treat received SMS content as evidence: preserve its source and timestamps, and distinguish raw content from parsed fields.
+
+Do not expose results to other roles or users unless access is explicitly authorized.
+
+Shared Components and Responsive Behavior
+
+All roles use the same design tokens, typography, status badges, request cards, confirmation dialogs, audit timeline, and loading/error components. The differences are role-specific navigation, screen content, data scope, and actions—not separate visual styles.
+
+Use bottom navigation or a compact navigation rail appropriate to the device size.
+
+Keep one clear primary action per screen.
+
+Show request status as both a label and a visual indicator.
+
+Mask sensitive target numbers by default and reveal full values only when necessary and authorized.
+
+Keep audit timestamps and request identifiers easy to locate.
+
+Do not include sensitive target numbers, location results, credentials, or access tokens in share-link URLs or analytics events.
+
+Role-Based UI Acceptance Criteria
+
+An Officer signs in and sees only Officer navigation and permitted request data.
+
+An IO signs in and sees the IO dashboard and pending-request workflow.
+
+Officer-only actions are not presented in the IO UI, and IO execution actions are not presented in the Officer UI.
+
+Direct API calls with the wrong role are rejected by the backend, even if attempted outside the UI.
+
+Unknown roles and expired/invalid sessions fail closed.
+
+Each role's screens have loading, empty, success, and error states.
+
+A link opening or request review never triggers execution without an explicit user action and required backend authorization.
+
+Color Palette & Theme
+
+Design objective: a restrained, professional, high-legibility, role-based interface optimized for Officer and IO workflows, with a shared visual system and role-specific navigation, data, and actions.
+
+Theme
+
+Use a light-first neutral theme with a dark theme available later if required.
 
 The visual hierarchy should be created primarily through:
 
-- Neutral surfaces
-- Typography
-- Spacing
-- Borders
-- Semantic status colors
-- Controlled elevation
+Neutral surfaces
+
+Typography
+
+Spacing
+
+Borders
+
+Semantic status colors
+
+Controlled elevation
 
 Avoid gradients, decorative illustrations, excessive shadows, glassmorphism, and highly saturated backgrounds.
 
-Flutter's Material 3 `ColorScheme` provides an appropriate foundation for centralized color management.
+Flutter's Material 3 ColorScheme provides an appropriate foundation for centralized color management.
 
-### Proposed Light Palette
+Proposed Light Palette
 
-| Token | Example | Purpose |
-|---|---|---|
-| `primary` | `#17324D` | Main navigation and primary actions |
-| `primaryContainer` | `#DCE8F2` | Selected/secondary primary surfaces |
-| `secondary` | `#52677A` | Supporting actions |
-| `surface` | `#F8FAFC` | Application background |
-| `surfaceContainer` | `#FFFFFF` | Cards and elevated content |
-| `textPrimary` | `#17212B` | Main text |
-| `textSecondary` | `#52606D` | Supporting text |
-| `border` | `#CBD5E1` | Dividers and field borders |
-| `success` | `#18794E` | Completed/success state |
-| `warning` | `#9A6700` | Warning/pending condition |
-| `error` | `#B42318` | Failure/error state |
-| `info` | `#175CD3` | Informational state |
+Token
 
-> These hexadecimal values are **project design choices**, not official IFSO colors.
+Example
 
-### Accessibility
+Purpose
 
-Normal text should target at least **4.5:1 contrast**, while large text should target at least **3:1**, consistent with WCAG 2.2 AA guidance.
+primary
+
+#17324D
+
+Main navigation and primary actions
+
+primaryContainer
+
+#DCE8F2
+
+Selected/secondary primary surfaces
+
+secondary
+
+#52677A
+
+Supporting actions
+
+surface
+
+#F8FAFC
+
+Application background
+
+surfaceContainer
+
+#FFFFFF
+
+Cards and elevated content
+
+textPrimary
+
+#17212B
+
+Main text
+
+textSecondary
+
+#52606D
+
+Supporting text
+
+border
+
+#CBD5E1
+
+Dividers and field borders
+
+success
+
+#18794E
+
+Completed/success state
+
+warning
+
+#9A6700
+
+Warning/pending condition
+
+error
+
+#B42318
+
+Failure/error state
+
+info
+
+#175CD3
+
+Informational state
+
+These hexadecimal values are project design choices, not official IFSO colors.
+
+Accessibility
+
+Normal text should target at least 4.5:1 contrast, while large text should target at least 3:1, consistent with WCAG 2.2 AA guidance.
 
 Status must never be communicated through color alone.
 
 Example:
 
-> 🟢 **COMPLETED**  
-> Location response received and processed.
+🟢 COMPLETED
+Location response received and processed.
 
 rather than displaying only a green indicator.
 
----
-
-## Fonts
+Fonts
 
 Use a simple two-font strategy.
 
-### Primary UI Font
+Primary UI Font
 
-**Inter**
+Inter
 
 Use for:
 
-- Navigation
-- Buttons
-- Forms
-- Headings
-- Tables
-- Status labels
-- General application content
+Navigation
+
+Buttons
+
+Forms
+
+Headings
+
+Tables
+
+Status labels
+
+General application content
 
 If Inter is not bundled, use an appropriate platform sans-serif fallback.
 
-### Monospace Font
+Monospace Font
 
-**JetBrains Mono** or platform monospace fallback.
+JetBrains Mono or platform monospace fallback.
 
 Use only for technical information:
 
-- Request IDs
-- Audit IDs
-- Timestamps
-- Hashes
-- Raw SMS responses
-- Technical error identifiers
-- Log/event identifiers
+Request IDs
+
+Audit IDs
+
+Timestamps
+
+Hashes
+
+Raw SMS responses
+
+Technical error identifiers
+
+Log/event identifiers
 
 Example:
 
-```text
 Request ID
 REQ-7F2A91
 
 SHA-256
 7f3a...c821
-```
 
 Do not use monospace for normal UI text.
 
----
-
-## Typography
+Typography
 
 The hierarchy should be compact but readable because the application may display relatively dense forensic information.
 
-| Style | Size | Weight | Usage |
-|---|---:|---:|---|
-| Display | 28–32 px | 600–700 | Major screen heading |
-| H1 | 24 px | 600 | Page heading |
-| H2 | 20 px | 600 | Section heading |
-| H3 | 17–18 px | 600 | Card/subsection heading |
-| Body Large | 16 px | 400 | Important body content |
-| Body | 14–16 px | 400 | Normal content |
-| Label | 13–14 px | 500–600 | Form labels/status |
-| Caption | 12 px | 400 | Secondary metadata |
-| Technical | 12–14 px | 400 | IDs/raw evidence |
+Style
+
+Size
+
+Weight
+
+Usage
+
+Display
+
+28–32 px
+
+600–700
+
+Major screen heading
+
+H1
+
+24 px
+
+600
+
+Page heading
+
+H2
+
+20 px
+
+600
+
+Section heading
+
+H3
+
+17–18 px
+
+600
+
+Card/subsection heading
+
+Body Large
+
+16 px
+
+400
+
+Important body content
+
+Body
+
+14–16 px
+
+400
+
+Normal content
+
+Label
+
+13–14 px
+
+500–600
+
+Form labels/status
+
+Caption
+
+12 px
+
+400
+
+Secondary metadata
+
+Technical
+
+12–14 px
+
+400
+
+IDs/raw evidence
 
 Prefer comfortable line height rather than tightly packed text.
 
-Flutter's Material 3 typography system provides a structured `TextTheme`, making centralized typography preferable to individually styling every widget.
+Flutter's Material 3 typography system provides a structured TextTheme, making centralized typography preferable to individually styling every widget.
 
-### Sensitive Information
+Sensitive Information
 
 Target numbers and location information should have deliberate visual hierarchy.
 
 Example:
 
-```text
 TARGET NUMBER
 
 +91 XXXXXXX123
 
 STATUS
 WAITING_RESPONSE
-```
 
 Where appropriate, default to partial masking rather than displaying sensitive identifiers unnecessarily.
 
----
-
-## Design Tokens & Examples
+Design Tokens & Examples
 
 All visual values should be represented as reusable tokens rather than hard-coded throughout the application.
 
-### Color Tokens
+Color Tokens
 
-```text
 color.primary
 color.primaryContainer
 
@@ -164,13 +457,11 @@ color.success
 color.warning
 color.error
 color.info
-```
 
-### Spacing Tokens
+Spacing Tokens
 
 Use an 8-point spacing system:
 
-```text
 space.1 = 4px
 space.2 = 8px
 space.3 = 12px
@@ -179,23 +470,19 @@ space.5 = 20px
 space.6 = 24px
 space.8 = 32px
 space.10 = 40px
-```
 
-### Shape Tokens
+Shape Tokens
 
-```text
 radius.small  = 6px
 radius.medium = 10px
 radius.large  = 16px
-```
 
 Avoid excessive rounding. This is an operational application rather than a consumer social application.
 
-### Component Examples
+Component Examples
 
-#### Request Card
+Request Card
 
-```text
 ┌──────────────────────────────────────────┐
 │ Request #REQ-7F2A91       CREATED        │
 │                                          │
@@ -205,11 +492,9 @@ Avoid excessive rounding. This is an operational application rather than a consu
 │                                          │
 │                    View Request →        │
 └──────────────────────────────────────────┘
-```
 
-#### IO Review
+IO Review
 
-```text
 ┌──────────────────────────────────────────┐
 │ LOCATION REQUEST                         │
 │                                          │
@@ -221,13 +506,11 @@ Avoid excessive rounding. This is an operational application rather than a consu
 │                                          │
 │       [ Execute Location Request ]       │
 └──────────────────────────────────────────┘
-```
 
 The execution action must be visually distinct from ordinary navigation.
 
-#### Waiting State
+Waiting State
 
-```text
 ┌──────────────────────────────────────────┐
 │ WAITING_RESPONSE                         │
 │                                          │
@@ -236,11 +519,9 @@ The execution action must be visually distinct from ordinary navigation.
 │                                          │
 │ Awaiting response...                     │
 └──────────────────────────────────────────┘
-```
 
-#### Completed State
+Completed State
 
-```text
 ┌──────────────────────────────────────────┐
 │ ✓ COMPLETED                              │
 │                                          │
@@ -249,11 +530,9 @@ The execution action must be visually distinct from ordinary navigation.
 │                                          │
 │ [ View Result ] [ Share Result ]          │
 └──────────────────────────────────────────┘
-```
 
-#### Audit Timeline
+Audit Timeline
 
-```text
 13:42  CREATED
        Request submitted
 
@@ -265,81 +544,151 @@ The execution action must be visually distinct from ordinary navigation.
 
 13:47  COMPLETED
        Response received
-```
 
-### State Design
+State Design
 
 The UI should directly reflect the backend request lifecycle.
 
-| State | UI Meaning | Visual Treatment |
-|---|---|---|
-| `CREATED` | Request submitted | Neutral |
-| `PENDING_IO_REVIEW` | Waiting for IO | Informational |
-| `EXECUTING` | IO initiated request | Active/emphasized |
-| `WAITING_RESPONSE` | Awaiting response | Warning/pending |
-| `COMPLETED` | Response processed | Success |
-| `SMS_FAILED` | SMS transmission failed | Error |
-| `TIMEOUT` | Response not received in expected window | Warning/Error |
-| `RESPONSE_INVALID` | Response could not be validated | Error |
+State
 
-These are **application states**, not claims about any telecom provider's internal status terminology.
+UI Meaning
 
----
+Visual Treatment
 
-## Style Guide: Do’s & Don’ts
+CREATED
 
-### Do
+Request submitted
 
-- Use consistent Material 3 components.
-- Use centralized theme tokens.
-- Keep primary actions visually obvious.
-- Require deliberate confirmation before executing a location request.
-- Display request state explicitly.
-- Show timestamps for important actions.
-- Preserve a clear audit trail.
-- Mask sensitive information when full visibility is unnecessary.
-- Use icons **and text** for important statuses.
-- Provide clear loading, offline, timeout, and failure states.
-- Maintain sufficient spacing between consequential actions.
-- Test interfaces with larger text settings.
+Neutral
 
-WCAG 2.2 specifies a minimum pointer target size of **24 × 24 CSS pixels** or equivalent spacing; for this application, important mobile controls should preferably be larger than that minimum.
+PENDING_IO_REVIEW
 
-### Don't
+Waiting for IO
 
-- Don't use color alone to communicate status.
-- Don't hide the execution action inside a generic menu.
-- Don't use vague buttons such as **"Continue"** when the action actually triggers a location request.
-- Don't automatically execute a request simply because an IO opened a link.
-- Don't expose complete sensitive information unnecessarily.
-- Don't put sensitive information into URLs.
-- Don't use real target numbers or operational telecom data in mockups.
-- Don't display raw responses as ordinary user-facing prose without distinguishing them as evidence/raw data.
-- Don't use excessive animations.
-- Don't use large decorative graphics that compete with operational information.
-- Don't create multiple competing primary buttons.
-- Don't hard-code colors throughout Flutter widgets.
-- Don't claim the visual system represents official IFSO branding without an approved brand specification.
+Informational
 
-### MVP Design Rule
+EXECUTING
 
-For the 10–15 day MVP, build **one coherent visual system**, not a large design system:
+IO initiated request
 
-1. Central `ColorScheme`
-2. Central `TextTheme`
-3. Spacing/radius tokens
-4. Reusable request card
-5. Reusable status badge
-6. Reusable confirmation dialog
-7. Reusable audit timeline
-8. Reusable error/loading states
-9. Reusable sensitive-data display/masking component
+Active/emphasized
 
-Flutter explicitly supports centralized `ThemeData`, `ColorScheme`, and `TextTheme`, so this approach maps cleanly onto the planned Flutter implementation.
+WAITING_RESPONSE
 
----
+Awaiting response
 
-## Design Sources
+Warning/pending
 
-- Flutter Material 3 documentation and migration guidance.
-- W3C WCAG 2.2 accessibility guidance.
+COMPLETED
+
+Response processed
+
+Success
+
+SMS_FAILED
+
+SMS transmission failed
+
+Error
+
+TIMEOUT
+
+Response not received in expected window
+
+Warning/Error
+
+RESPONSE_INVALID
+
+Response could not be validated
+
+Error
+
+These are application states, not claims about any telecom provider's internal status terminology.
+
+Style Guide: Do’s & Don’ts
+
+Do
+
+Use consistent Material 3 components.
+
+Use centralized theme tokens.
+
+Keep primary actions visually obvious.
+
+Require deliberate confirmation before executing a location request.
+
+Display request state explicitly.
+
+Show timestamps for important actions.
+
+Preserve a clear audit trail.
+
+Mask sensitive information when full visibility is unnecessary.
+
+Use icons and text for important statuses.
+
+Provide clear loading, offline, timeout, and failure states.
+
+Maintain sufficient spacing between consequential actions.
+
+Test interfaces with larger text settings.
+
+WCAG 2.2 specifies a minimum pointer target size of 24 × 24 CSS pixels or equivalent spacing; for this application, important mobile controls should preferably be larger than that minimum.
+
+Don't
+
+Don't use color alone to communicate status.
+
+Don't hide the execution action inside a generic menu.
+
+Don't use vague buttons such as "Continue" when the action actually triggers a location request.
+
+Don't automatically execute a request simply because an IO opened a link.
+
+Don't expose complete sensitive information unnecessarily.
+
+Don't put sensitive information into URLs.
+
+Don't use real target numbers or operational telecom data in mockups.
+
+Don't display raw responses as ordinary user-facing prose without distinguishing them as evidence/raw data.
+
+Don't use excessive animations.
+
+Don't use large decorative graphics that compete with operational information.
+
+Don't create multiple competing primary buttons.
+
+Don't hard-code colors throughout Flutter widgets.
+
+Don't claim the visual system represents official IFSO branding without an approved brand specification.
+
+MVP Design Rule
+
+For the 10–15 day MVP, build one coherent visual system, not a large design system:
+
+Central ColorScheme
+
+Central TextTheme
+
+Spacing/radius tokens
+
+Reusable request card
+
+Reusable status badge
+
+Reusable confirmation dialog
+
+Reusable audit timeline
+
+Reusable error/loading states
+
+Reusable sensitive-data display/masking component
+
+Flutter explicitly supports centralized ThemeData, ColorScheme, and TextTheme, so this approach maps cleanly onto the planned Flutter implementation.
+
+Design Sources
+
+Flutter Material 3 documentation and migration guidance.
+
+W3C WCAG 2.2 accessibility guidance.

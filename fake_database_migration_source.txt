@@ -1,0 +1,1801 @@
+
+
+========== backend\tests\conftest.py ==========
+
+"""Pytest Test Configuration and Fixtures."""
+
+import copy
+from types import SimpleNamespace
+from typing import Any, Dict
+import pytest
+import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
+
+from backend.app.core.config import Settings, get_settings
+from backend.app.core.database import db_manager
+from backend.app.main import create_application
+
+
+@pytest.fixture(scope="session")
+def test_settings() -> Settings:
+    """Return test settings with safe testing defaults."""
+    return Settings(
+        app_env="testing",
+        app_debug=True,
+        database_url="postgresql+psycopg://ifso_test:ifso_test@127.0.0.1:29999/ifso_location_test",
+        database_name="ifso_location_test",
+        database_pool_timeout_seconds=1,
+    )
+
+
+@pytest_asyncio.fixture
+async def async_client(test_settings: Settings) -> AsyncClient:
+    """Provide an asynchronous HTTP client wired to the FastAPI test instance."""
+    app = create_application()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        yield client
+
+
+def _get_nested(document: Dict[str, Any], path: str) -> Any:
+    current: Any = document
+    for part in path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def _set_nested(document: Dict[str, Any], path: str, value: Any) -> None:
+    current = document
+    parts = path.split(".")
+    for part in parts[:-1]:
+        if part not in current or not isinstance(current[part], dict):
+            current[part] = {}
+        current = current[part]
+    current[parts[-1]] = value
+
+
+def _matches(document: Dict[str, Any], query: Dict[str, Any]) -> bool:
+    for key, expected in query.items():
+        if _get_nested(document, key) != expected:
+            return False
+    return True
+
+class FakeCursor:
+    def __init__(self, documents: list[Dict[str, Any]]) -> None:
+        self.documents = documents
+
+    def sort(self, key: str, direction: int):
+        self.documents.sort(
+            key=lambda document: document.get(key) or "",
+            reverse=direction < 0,
+        )
+        return self
+
+    def __aiter__(self):
+        async def iterate():
+            for document in self.documents:
+                yield copy.deepcopy(document)
+
+        return iterate()
+
+class FakeCollection:
+    def __init__(self) -> None:
+        self.documents: list[Dict[str, Any]] = []
+
+    async def insert_one(self, document: Dict[str, Any]):
+        self.documents.append(copy.deepcopy(document))
+        return SimpleNamespace(inserted_id=len(self.documents))
+
+    async def find_one(
+        self,
+        query: Dict[str, Any],
+        projection: Dict[str, int] | None = None,
+    ):
+        for document in self.documents:
+            if _matches(document, query):
+                return copy.deepcopy(document)
+        return None
+
+    def find(self, query: Dict[str, Any]) -> FakeCursor:
+        matching_documents = [
+            copy.deepcopy(document)
+            for document in self.documents
+            if _matches(document, query)
+        ]
+        return FakeCursor(matching_documents)
+
+    async def update_one(
+        self,
+        query: Dict[str, Any],
+        update: Dict[str, Any],
+    ):
+        for document in self.documents:
+            if _matches(document, query):
+                for key, value in update.get("$set", {}).items():
+                    _set_nested(document, key, value)
+                return SimpleNamespace(modified_count=1)
+        return SimpleNamespace(modified_count=0)
+
+
+class FakeDatabase:
+    def __init__(self) -> None:
+        self.location_requests = FakeCollection()
+        self.operators = FakeCollection()
+        self.audit_logs = FakeCollection()
+
+    def __getitem__(self, name: str):
+        return getattr(self, name)
+
+
+@pytest.fixture
+def fake_database(monkeypatch: pytest.MonkeyPatch) -> FakeDatabase:
+    fake_db = FakeDatabase()
+    monkeypatch.setattr(db_manager, "get_database", lambda: fake_db)
+    return fake_db
+
+
+========== backend\tests\test_requests_io_pending.py ==========
+
+"""Tests for the Phase 3 IO pending-requests endpoint."""
+
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from backend.app.models.enums import RequestState
+from backend.app.models.location_request import LocationRequestDocument
+
+
+# Development/testing authentication tokens configured by the application.
+IO_AUTH = {"Authorization": "Bearer dev-io-token"}
+OFFICER_AUTH = {"Authorization": "Bearer dev-officer-token"}
+
+
+def _make_request_document(
+    *,
+    request_id: str,
+    status: RequestState,
+    created_at: datetime,
+) -> dict:
+    """Create a valid persisted request document for endpoint tests."""
+    document = LocationRequestDocument.create_new(
+        request_id=request_id,
+        case_id=f"CASE-{request_id}",
+        target_phone_number="+919876543210",
+        operator_code="JIO",
+        submitting_officer_id="OFFICER-DEV-001",
+    ).model_dump(mode="json")
+
+    document["status"] = status.value
+    document["created_at"] = created_at.isoformat()
+    document["updated_at"] = created_at.isoformat()
+
+    return document
+
+
+@pytest.mark.asyncio
+async def test_io_can_retrieve_pending_requests(
+    async_client,
+    fake_database,
+):
+    """An authenticated IO can retrieve requests awaiting review."""
+    now = datetime.now(timezone.utc)
+
+    pending_request = _make_request_document(
+        request_id="REQ-PENDING-001",
+        status=RequestState.PENDING_IO_REVIEW,
+        created_at=now,
+    )
+
+    await fake_database.location_requests.insert_one(pending_request)
+
+    response = await async_client.get(
+        "/api/v1/requests/io/pending",
+        headers=IO_AUTH,
+    )
+
+    assert response.status_code == 200
+
+    payload = response.json()
+
+    assert payload["success"] is True
+    assert isinstance(payload["data"], list)
+    assert len(payload["data"]) == 1
+    assert payload["data"][0]["request_id"] == "REQ-PENDING-001"
+    assert payload["data"][0]["status"] == "PENDING_IO_REVIEW"
+
+
+@pytest.mark.asyncio
+async def test_pending_queue_excludes_requests_in_other_states(
+    async_client,
+    fake_database,
+):
+    """Only PENDING_IO_REVIEW requests should appear in the IO queue."""
+    now = datetime.now(timezone.utc)
+
+    pending_request = _make_request_document(
+        request_id="REQ-PENDING-002",
+        status=RequestState.PENDING_IO_REVIEW,
+        created_at=now,
+    )
+
+    created_request = _make_request_document(
+        request_id="REQ-CREATED-001",
+        status=RequestState.CREATED,
+        created_at=now - timedelta(minutes=1),
+    )
+
+    executing_request = _make_request_document(
+        request_id="REQ-EXECUTING-001",
+        status=RequestState.EXECUTING,
+        created_at=now - timedelta(minutes=2),
+    )
+
+    await fake_database.location_requests.insert_one(pending_request)
+    await fake_database.location_requests.insert_one(created_request)
+    await fake_database.location_requests.insert_one(executing_request)
+
+    response = await async_client.get(
+        "/api/v1/requests/io/pending",
+        headers=IO_AUTH,
+    )
+
+    assert response.status_code == 200
+
+    payload = response.json()
+
+    assert payload["success"] is True
+
+    returned_ids = [
+        item["request_id"]
+        for item in payload["data"]
+    ]
+
+    assert returned_ids == ["REQ-PENDING-002"]
+
+
+@pytest.mark.asyncio
+async def test_pending_requests_are_ordered_newest_first(
+    async_client,
+    fake_database,
+):
+    """The newest pending request should appear first."""
+    now = datetime.now(timezone.utc)
+
+    older_request = _make_request_document(
+        request_id="REQ-OLDER-001",
+        status=RequestState.PENDING_IO_REVIEW,
+        created_at=now - timedelta(hours=2),
+    )
+
+    newer_request = _make_request_document(
+        request_id="REQ-NEWER-001",
+        status=RequestState.PENDING_IO_REVIEW,
+        created_at=now - timedelta(minutes=5),
+    )
+
+    newest_request = _make_request_document(
+        request_id="REQ-NEWEST-001",
+        status=RequestState.PENDING_IO_REVIEW,
+        created_at=now,
+    )
+
+    # Insert them in a different order to verify database sorting.
+    await fake_database.location_requests.insert_one(older_request)
+    await fake_database.location_requests.insert_one(newest_request)
+    await fake_database.location_requests.insert_one(newer_request)
+
+    response = await async_client.get(
+        "/api/v1/requests/io/pending",
+        headers=IO_AUTH,
+    )
+
+    assert response.status_code == 200
+
+    returned_ids = [
+        item["request_id"]
+        for item in response.json()["data"]
+    ]
+
+    assert returned_ids == [
+        "REQ-NEWEST-001",
+        "REQ-NEWER-001",
+        "REQ-OLDER-001",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_officer_cannot_access_pending_io_queue(
+    async_client,
+    fake_database,
+):
+    """An officer must not access the IO-only pending queue."""
+    response = await async_client.get(
+        "/api/v1/requests/io/pending",
+        headers=OFFICER_AUTH,
+    )
+
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_pending_queue_returns_empty_list_when_no_requests_exist(
+    async_client,
+    fake_database,
+):
+    """An empty queue should return HTTP 200 and an empty data list."""
+    response = await async_client.get(
+        "/api/v1/requests/io/pending",
+        headers=IO_AUTH,
+    )
+
+    assert response.status_code == 200
+
+    payload = response.json()
+
+    assert payload["success"] is True
+    assert payload["data"] == []
+
+
+========== backend\tests\test_requests_phase2.py ==========
+
+"""Phase 2 request management API tests."""
+
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from typing import Any, Dict
+import copy
+import re
+import pytest
+
+from backend.app.core.database import db_manager
+from backend.app.models.location_request import LocationRequestDocument
+from backend.tests.conftest import FakeDatabase
+
+
+OFFICER_AUTH = {"Authorization": "Bearer dev-officer-token"}
+IO_AUTH = {"Authorization": "Bearer dev-io-token"}
+ADMIN_AUTH = {"Authorization": "Bearer dev-admin-token"}
+
+
+def _get_nested(document: Dict[str, Any], path: str) -> Any:
+    current: Any = document
+    for part in path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def _set_nested(document: Dict[str, Any], path: str, value: Any) -> None:
+    current = document
+    parts = path.split(".")
+    for part in parts[:-1]:
+        if part not in current or not isinstance(current[part], dict):
+            current[part] = {}
+        current = current[part]
+    current[parts[-1]] = value
+
+
+def _matches(document: Dict[str, Any], query: Dict[str, Any]) -> bool:
+    for key, expected in query.items():
+        if _get_nested(document, key) != expected:
+            return False
+    return True
+
+async def _create_pending_request(async_client, fake_database) -> str:
+    await fake_database.operators.insert_one({"operator_code": "JIO", "is_active": True})
+    create_response = await async_client.post(
+        "/api/v1/requests",
+        json={
+            "case_id": "FIR-2026-EXEC-1",
+            "target_phone_number": "9876543210",
+            "operator_code": "JIO",
+        },
+        headers=OFFICER_AUTH,
+    )
+    request_id = create_response.json()["data"]["request_id"]
+    mint_response = await async_client.post(
+        f"/api/v1/requests/{request_id}/share-link",
+        headers=OFFICER_AUTH,
+    )
+    token = mint_response.json()["data"]["shareable_link"].rsplit("/", 1)[-1]
+    access_response = await async_client.get(f"/api/v1/request-links/{token}", headers=IO_AUTH)
+    assert access_response.status_code == 200
+    return request_id
+
+
+@pytest.mark.asyncio
+async def test_create_request_success_and_persistence(async_client, fake_database: FakeDatabase):
+    await fake_database.operators.insert_one({"operator_code": "JIO", "is_active": True})
+
+    response = await async_client.post(
+        "/api/v1/requests",
+        json={
+            "case_id": "FIR-2026-REQ-1",
+            "target_phone_number": "9876543210",
+            "operator_code": " jio ",
+            "remarks": "Urgent follow-up",
+        },
+        headers={**OFFICER_AUTH, "x-officer-id": "OFFICER-77"},
+    )
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["success"] is True
+    data = payload["data"]
+    assert data["request_id"].startswith("REQ-")
+    assert data["operator_code"] == "JIO"
+    assert data["submitting_officer_id"] == "OFFICER-DEV-001"
+    assert data["target_phone_masked"].endswith("3210")
+    assert "+919876543210" not in str(data)
+    assert data["shareable_link"] is None
+
+    stored = fake_database.location_requests.documents[0]
+    assert "target_phone_number" not in stored
+    assert stored["target_phone_encrypted"] != "+919876543210"
+    assert "+919876543210" not in str(stored)
+    stored_document = LocationRequestDocument.model_validate(stored)
+    assert stored_document.decrypt_target_phone_number() == "+919876543210"
+    assert stored["status"] == "CREATED"
+    assert stored["share_token"] is None
+    assert len(fake_database.audit_logs.documents) == 1
+    assert fake_database.audit_logs.documents[0]["event_type"] == "REQUEST_CREATED"
+
+
+@pytest.mark.asyncio
+async def test_create_request_invalid_phone(async_client, fake_database: FakeDatabase):
+    await fake_database.operators.insert_one({"operator_code": "JIO", "is_active": True})
+    response = await async_client.post(
+        "/api/v1/requests",
+        json={
+            "case_id": "FIR-2026-REQ-2",
+            "target_phone_number": "12345",
+            "operator_code": "JIO",
+        },
+        headers=OFFICER_AUTH,
+    )
+    assert response.status_code == 422
+    payload = response.json()
+    assert payload["success"] is False
+    assert payload["error"]["code"] == "REQUEST_VALIDATION_FAILED"
+
+
+@pytest.mark.asyncio
+async def test_create_request_rejects_inactive_operator(async_client, fake_database: FakeDatabase):
+    await fake_database.operators.insert_one({"operator_code": "VI", "is_active": False})
+    response = await async_client.post(
+        "/api/v1/requests",
+        json={
+            "case_id": "FIR-2026-REQ-3",
+            "target_phone_number": "9876543210",
+            "operator_code": "VI",
+        },
+        headers=OFFICER_AUTH,
+    )
+    assert response.status_code == 422
+    payload = response.json()
+    assert payload["success"] is False
+    assert payload["error"]["code"] == "VALIDATION_ERROR"
+
+
+@pytest.mark.asyncio
+async def test_get_request_and_404(async_client, fake_database: FakeDatabase):
+    await fake_database.operators.insert_one({"operator_code": "AIRTEL", "is_active": True})
+    create_response = await async_client.post(
+        "/api/v1/requests",
+        json={
+            "case_id": "FIR-2026-REQ-4",
+            "target_phone_number": "9876543210",
+            "operator_code": "AIRTEL",
+        },
+        headers=OFFICER_AUTH,
+    )
+    request_id = create_response.json()["data"]["request_id"]
+
+    fetch_response = await async_client.get(
+        f"/api/v1/requests/{request_id}", headers=OFFICER_AUTH
+    )
+    assert fetch_response.status_code == 200
+    fetched = fetch_response.json()["data"]
+    assert fetched["request_id"] == request_id
+    assert fetched["shareable_link"] is None
+    assert fetched["target_phone_masked"].endswith("3210")
+
+    unknown = await async_client.get(
+        "/api/v1/requests/REQ-DOES-NOT-EXIST", headers=OFFICER_AUTH
+    )
+    assert unknown.status_code == 404
+    assert unknown.json()["error"]["code"] == "RESOURCE_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_authentication_required_invalid_token_and_no_fallback(
+    async_client, fake_database: FakeDatabase
+):
+    await fake_database.operators.insert_one({"operator_code": "JIO", "is_active": True})
+    payload = {
+        "case_id": "FIR-2026-AUTH-1",
+        "target_phone_number": "9876543210",
+        "operator_code": "JIO",
+    }
+
+    unauthenticated = await async_client.post("/api/v1/requests", json=payload)
+    assert unauthenticated.status_code == 401
+
+    invalid = await async_client.post(
+        "/api/v1/requests",
+        json=payload,
+        headers={"Authorization": "Bearer definitely-not-valid"},
+    )
+    assert invalid.status_code == 401
+
+    spoofed_header_only = await async_client.post(
+        "/api/v1/requests",
+        json=payload,
+        headers={"x-officer-id": "OFFICER-SPOOF"},
+    )
+    assert spoofed_header_only.status_code == 401
+    assert fake_database.location_requests.documents == []
+
+
+@pytest.mark.asyncio
+async def test_get_request_enforces_ownership_and_privileged_access(
+    async_client, fake_database: FakeDatabase
+):
+    own_document = LocationRequestDocument.create_new(
+        request_id="REQ-OWNED",
+        case_id="CASE-OWNED",
+        target_phone_number="+919876543210",
+        operator_code="JIO",
+        submitting_officer_id="OFFICER-DEV-001",
+    )
+    other_document = LocationRequestDocument.create_new(
+        request_id="REQ-OTHER",
+        case_id="CASE-OTHER",
+        target_phone_number="+919876543211",
+        operator_code="JIO",
+        submitting_officer_id="OFFICER-OTHER",
+    )
+    await fake_database.location_requests.insert_one(own_document.model_dump(mode="json"))
+    await fake_database.location_requests.insert_one(other_document.model_dump(mode="json"))
+
+    own = await async_client.get("/api/v1/requests/REQ-OWNED", headers=OFFICER_AUTH)
+    assert own.status_code == 200
+
+    unauthorized = await async_client.get("/api/v1/requests/REQ-OTHER", headers=OFFICER_AUTH)
+    assert unauthorized.status_code == 404
+    assert "CASE-OTHER" not in str(unauthorized.json())
+    assert "+919876543211" not in str(unauthorized.json())
+
+    privileged = await async_client.get("/api/v1/requests/REQ-OTHER", headers=IO_AUTH)
+    assert privileged.status_code == 200
+    assert privileged.json()["data"]["request_id"] == "REQ-OTHER"
+
+
+@pytest.mark.asyncio
+async def test_token_access_success_replay_invalid_and_expired(
+    async_client, fake_database: FakeDatabase
+):
+    await fake_database.operators.insert_one({"operator_code": "BSNL", "is_active": True})
+    create_response = await async_client.post(
+        "/api/v1/requests",
+        json={
+            "case_id": "FIR-2026-REQ-5",
+            "target_phone_number": "9876543210",
+            "operator_code": "BSNL",
+        },
+        headers=OFFICER_AUTH,
+    )
+    request_id = create_response.json()["data"]["request_id"]
+    mint_response = await async_client.post(
+        f"/api/v1/requests/{request_id}/share-link",
+        headers={**OFFICER_AUTH, "x-officer-id": "OFFICER-SPOOF"},
+    )
+    assert mint_response.status_code == 200
+    shareable_link = mint_response.json()["data"]["shareable_link"]
+    token = shareable_link.rsplit("/", 1)[-1]
+    assert re.match(r"^[A-Za-z0-9\-_]+$", token)
+    assert len(token) >= 32
+    assert "FIR-2026-REQ-5" not in shareable_link
+    assert "9876543210" not in shareable_link
+    assert request_id not in shareable_link
+    stored_share_token = fake_database.location_requests.documents[0]["share_token"]
+    assert "token_hash" in stored_share_token
+    assert stored_share_token["token_hash"] != token
+    assert "token" not in stored_share_token
+
+    first_access = await async_client.get(
+        f"/api/v1/request-links/{token}",
+        headers={**IO_AUTH, "x-actor-id": "IO-SPOOF"},
+    )
+    assert first_access.status_code == 200
+    assert first_access.json()["data"]["shareable_link"] is None
+    assert any(
+        audit["event_type"] == "SHAREABLE_LINK_ACCESSED"
+        and audit["actor_id"] == "IO-DEV-001"
+        for audit in fake_database.audit_logs.documents
+    )
+
+    replay = await async_client.get(f"/api/v1/request-links/{token}", headers=IO_AUTH)
+    assert replay.status_code == 404
+    assert replay.json()["error"]["code"] == "RESOURCE_NOT_FOUND"
+
+    invalid = await async_client.get(
+        "/api/v1/request-links/invalidtokeninvalidtokeninvalidtoken",
+        headers=IO_AUTH,
+    )
+    assert invalid.status_code == 404
+
+    create_response_expired = await async_client.post(
+        "/api/v1/requests",
+        json={
+            "case_id": "FIR-2026-REQ-6",
+            "target_phone_number": "9876543210",
+            "operator_code": "BSNL",
+        },
+        headers=OFFICER_AUTH,
+    )
+    expired_request_id = create_response_expired.json()["data"]["request_id"]
+    expired_link_response = await async_client.post(
+        f"/api/v1/requests/{expired_request_id}/share-link",
+        headers=OFFICER_AUTH,
+    )
+    expired_token = expired_link_response.json()["data"]["shareable_link"].rsplit("/", 1)[-1]
+    fake_database.location_requests.documents[-1]["share_token"]["expires_at"] = datetime.now(
+        timezone.utc
+    ) - timedelta(hours=1)
+    expired_access = await async_client.get(
+        f"/api/v1/request-links/{expired_token}", headers=IO_AUTH
+    )
+    assert expired_access.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_share_link_requires_io_auth(async_client, fake_database: FakeDatabase):
+    await fake_database.operators.insert_one({"operator_code": "BSNL", "is_active": True})
+    create_response = await async_client.post(
+        "/api/v1/requests",
+        json={
+            "case_id": "FIR-2026-REQ-7",
+            "target_phone_number": "9876543210",
+            "operator_code": "BSNL",
+        },
+        headers=OFFICER_AUTH,
+    )
+    request_id = create_response.json()["data"]["request_id"]
+    link_response = await async_client.post(
+        f"/api/v1/requests/{request_id}/share-link",
+        headers=OFFICER_AUTH,
+    )
+    token = link_response.json()["data"]["shareable_link"].rsplit("/", 1)[-1]
+
+    no_auth = await async_client.get(f"/api/v1/request-links/{token}")
+    assert no_auth.status_code == 401
+
+    officer_auth = await async_client.get(
+        f"/api/v1/request-links/{token}", headers=OFFICER_AUTH
+    )
+    assert officer_auth.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_execute_request_success_persists_metadata_and_audit(
+    async_client, fake_database: FakeDatabase
+):
+    request_id = await _create_pending_request(async_client, fake_database)
+
+    execute_response = await async_client.post(
+        f"/api/v1/requests/{request_id}/execute",
+        json={"io_device_id": "MDM-DEVICE-01", "sim_slot_index": 1},
+        headers=IO_AUTH,
+    )
+    assert execute_response.status_code == 200
+    payload = execute_response.json()
+    assert payload["success"] is True
+    assert payload["data"]["status"] == "EXECUTING"
+    assert payload["data"]["executing_io_id"] == "IO-DEV-001"
+    assert payload["data"]["io_device_id"] == "MDM-DEVICE-01"
+    assert payload["data"]["sim_slot_index"] == 1
+
+    stored = next(
+        doc
+        for doc in fake_database.location_requests.documents
+        if doc["request_id"] == request_id
+    )
+    assert stored["status"] == "EXECUTING"
+    assert stored["executing_io_id"] == "IO-DEV-001"
+    assert stored["execution_info"]["io_device_id"] == "MDM-DEVICE-01"
+    assert stored["execution_info"]["sim_slot_index"] == 1
+    assert stored["execution_info"]["dispatched_at"] is not None
+
+    assert any(
+        audit["event_type"] == "EXECUTION_TRIGGERED"
+        and audit["request_id"] == request_id
+        and audit["actor_id"] == "IO-DEV-001"
+        for audit in fake_database.audit_logs.documents
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_request_denies_officer(async_client, fake_database: FakeDatabase):
+    request_id = await _create_pending_request(async_client, fake_database)
+    response = await async_client.post(
+        f"/api/v1/requests/{request_id}/execute",
+        json={"io_device_id": "MDM-DEVICE-02", "sim_slot_index": 0},
+        headers=OFFICER_AUTH,
+    )
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "FORBIDDEN"
+
+
+@pytest.mark.asyncio
+async def test_execute_request_denies_unauthenticated(async_client, fake_database: FakeDatabase):
+    request_id = await _create_pending_request(async_client, fake_database)
+    response = await async_client.post(
+        f"/api/v1/requests/{request_id}/execute",
+        json={"io_device_id": "MDM-DEVICE-03", "sim_slot_index": 0},
+    )
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "UNAUTHORIZED"
+
+
+@pytest.mark.asyncio
+async def test_execute_request_rejects_wrong_state(async_client, fake_database: FakeDatabase):
+    await fake_database.operators.insert_one({"operator_code": "JIO", "is_active": True})
+    create_response = await async_client.post(
+        "/api/v1/requests",
+        json={
+            "case_id": "FIR-2026-EXEC-2",
+            "target_phone_number": "9876543210",
+            "operator_code": "JIO",
+        },
+        headers=OFFICER_AUTH,
+    )
+    request_id = create_response.json()["data"]["request_id"]
+
+    execute_response = await async_client.post(
+        f"/api/v1/requests/{request_id}/execute",
+        json={"io_device_id": "MDM-DEVICE-04", "sim_slot_index": 0},
+        headers=IO_AUTH,
+    )
+    assert execute_response.status_code == 409
+    payload = execute_response.json()
+    assert payload["error"]["code"] == "INVALID_STATE_TRANSITION"
+
+
+========== backend\tests\test_requests_phase3.py ==========
+
+"""Phase 3 Integration & Unit Tests for IO Execution, SMS Dispatch, and Response Ingestion."""
+
+import hashlib
+import pytest
+from httpx import ASGITransport, AsyncClient
+
+from backend.app.main import app
+from backend.app.models.location_request import LocationRequestDocument
+from backend.tests.test_requests_phase2 import (
+    ADMIN_AUTH,
+    IO_AUTH,
+    OFFICER_AUTH,
+    _create_pending_request,
+)
+
+
+
+@pytest.mark.asyncio
+async def test_execute_request_returns_dispatch_instructions(
+    async_client: AsyncClient, fake_database
+):
+    request_id = await _create_pending_request(async_client, fake_database)
+
+    execute_response = await async_client.post(
+        f"/api/v1/requests/{request_id}/execute",
+        json={"io_device_id": "MDM-IO-001", "sim_slot_index": 0},
+        headers=IO_AUTH,
+    )
+    assert execute_response.status_code == 200
+    payload = execute_response.json()
+    assert payload["success"] is True
+    assert payload["data"]["status"] == "EXECUTING"
+    assert "dispatch_instructions" in payload["data"]
+
+    instructions = payload["data"]["dispatch_instructions"]
+    assert instructions["service_number"] == "1512"
+    assert instructions["operator_code"] == "JIO"
+    assert instructions["sim_slot_index"] == 0
+    assert instructions["sms_body"] == "LOC +919876543210"
+
+
+@pytest.mark.asyncio
+async def test_record_send_status_success_transitions_to_waiting_response(
+    async_client: AsyncClient, fake_database
+):
+    request_id = await _create_pending_request(async_client, fake_database)
+
+    # First execute
+    await async_client.post(
+        f"/api/v1/requests/{request_id}/execute",
+        json={"io_device_id": "MDM-IO-001", "sim_slot_index": 0},
+        headers=IO_AUTH,
+    )
+
+    # Report send success
+    send_response = await async_client.post(
+        f"/api/v1/requests/{request_id}/send-status",
+        json={"success": True, "delivery_status": "SENT"},
+        headers=IO_AUTH,
+    )
+    assert send_response.status_code == 200
+    payload = send_response.json()
+    assert payload["success"] is True
+    assert payload["data"]["status"] == "WAITING_RESPONSE"
+
+    stored = next(
+        doc
+        for doc in fake_database.location_requests.documents
+        if doc["request_id"] == request_id
+    )
+    assert stored["status"] == "WAITING_RESPONSE"
+    assert stored["execution_info"]["delivery_status"] == "SENT"
+    assert stored["execution_info"]["attempt_count"] == 1
+
+    assert any(
+        audit["event_type"] == "SMS_DISPATCHED"
+        and audit["request_id"] == request_id
+        and audit["actor_id"] == "IO-DEV-001"
+        for audit in fake_database.audit_logs.documents
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_send_status_failure_transitions_to_sms_failed(
+    async_client: AsyncClient, fake_database
+):
+    request_id = await _create_pending_request(async_client, fake_database)
+
+    # Execute
+    await async_client.post(
+        f"/api/v1/requests/{request_id}/execute",
+        json={"io_device_id": "MDM-IO-001", "sim_slot_index": 0},
+        headers=IO_AUTH,
+    )
+
+    # Report send failure
+    send_response = await async_client.post(
+        f"/api/v1/requests/{request_id}/send-status",
+        json={
+            "success": False,
+            "error_message": "Radio off: No cellular coverage",
+        },
+        headers=IO_AUTH,
+    )
+    assert send_response.status_code == 200
+    payload = send_response.json()
+    assert payload["success"] is True
+    assert payload["data"]["status"] == "SMS_FAILED"
+
+    stored = next(
+        doc
+        for doc in fake_database.location_requests.documents
+        if doc["request_id"] == request_id
+    )
+    assert stored["status"] == "SMS_FAILED"
+    assert stored["execution_info"]["last_error"] == "Radio off: No cellular coverage"
+    assert stored["execution_info"]["attempt_count"] == 1
+
+    assert any(
+        audit["event_type"] == "SMS_FAILED"
+        and audit["request_id"] == request_id
+        and audit["actor_id"] == "IO-DEV-001"
+        for audit in fake_database.audit_logs.documents
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_send_status_rejects_non_executing_state(
+    async_client: AsyncClient, fake_database
+):
+    request_id = await _create_pending_request(async_client, fake_database)
+
+    # Try to report send status while still in PENDING_IO_REVIEW
+    send_response = await async_client.post(
+        f"/api/v1/requests/{request_id}/send-status",
+        json={"success": True, "delivery_status": "SENT"},
+        headers=IO_AUTH,
+    )
+    assert send_response.status_code == 409
+    assert send_response.json()["error"]["code"] == "INVALID_STATE_TRANSITION"
+
+
+@pytest.mark.asyncio
+async def test_submit_result_success_preserves_raw_sms_and_completes(
+    async_client: AsyncClient, fake_database
+):
+    request_id = await _create_pending_request(async_client, fake_database)
+
+    # Execute
+    await async_client.post(
+        f"/api/v1/requests/{request_id}/execute",
+        json={"io_device_id": "MDM-IO-001", "sim_slot_index": 0},
+        headers=IO_AUTH,
+    )
+
+    # Report SMS sent
+    await async_client.post(
+        f"/api/v1/requests/{request_id}/send-status",
+        json={"success": True, "delivery_status": "SENT"},
+        headers=IO_AUTH,
+    )
+
+    # Raw incoming telecom response
+    raw_telecom_sms = "Location: LAT:28.6139, LONG:77.2090, ACC:50m, TOWER:DL-DEL-041"
+    expected_hash = hashlib.sha256(raw_telecom_sms.encode("utf-8")).hexdigest()
+
+    result_response = await async_client.post(
+        f"/api/v1/requests/{request_id}/result",
+        json={
+            "raw_sms_content": raw_telecom_sms,
+            "sender_address": "1512",
+        },
+        headers=IO_AUTH,
+    )
+    assert result_response.status_code == 200
+    payload = result_response.json()
+    assert payload["success"] is True
+    assert payload["data"]["status"] == "COMPLETED"
+    assert payload["data"]["raw_hash_sha256"] == expected_hash
+
+    stored = next(
+        doc
+        for doc in fake_database.location_requests.documents
+        if doc["request_id"] == request_id
+    )
+    assert stored["status"] == "COMPLETED"
+    assert stored["response_info"]["raw_sms_content"] == raw_telecom_sms
+    assert stored["response_info"]["raw_hash_sha256"] == expected_hash
+    assert stored["response_info"]["sender_address"] == "1512"
+
+    # Audit log verification: raw content is NOT in audit logs, but hash and sender are
+    assert any(
+        audit["event_type"] == "SMS_RESPONSE_RECEIVED"
+        and audit["request_id"] == request_id
+        and audit["details"]["raw_hash_sha256"] == expected_hash
+        and audit["details"]["sender_address"] == "1512"
+        for audit in fake_database.audit_logs.documents
+    )
+    assert any(
+        audit["event_type"] == "REQUEST_COMPLETED"
+        and audit["request_id"] == request_id
+        for audit in fake_database.audit_logs.documents
+    )
+
+
+@pytest.mark.asyncio
+async def test_phase3_role_authorization(
+    async_client: AsyncClient, fake_database
+):
+    request_id = await _create_pending_request(async_client, fake_database)
+
+    # OFFICER forbidden from send-status
+    officer_send = await async_client.post(
+        f"/api/v1/requests/{request_id}/send-status",
+        json={"success": True},
+        headers=OFFICER_AUTH,
+    )
+    assert officer_send.status_code == 403
+
+    # Unauthenticated rejected from send-status
+    unauth_send = await async_client.post(
+        f"/api/v1/requests/{request_id}/send-status",
+        json={"success": True},
+    )
+    assert unauth_send.status_code == 401
+
+    # OFFICER forbidden from result submission
+    officer_result = await async_client.post(
+        f"/api/v1/requests/{request_id}/result",
+        json={"raw_sms_content": "test"},
+        headers=OFFICER_AUTH,
+    )
+    assert officer_result.status_code == 403
+
+    # Unauthenticated rejected from result submission
+    unauth_result = await async_client.post(
+        f"/api/v1/requests/{request_id}/result",
+        json={"raw_sms_content": "test"},
+    )
+    assert unauth_result.status_code == 401
+
+
+========== backend\tests\test_request_links.py ==========
+
+"""Regression tests for secure request-link access and IO review transitions."""
+
+import hashlib
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from backend.app.models.audit_log import AuditLogDocument
+from backend.app.models.enums import AuditEventType, RequestState
+from backend.app.models.location_request import (
+    LocationRequestDocument,
+    ShareTokenInfo,
+)
+
+IO_AUTH = {"Authorization": "Bearer dev-io-token"}
+
+VALID_TOKEN = "test-share-token-12345678901234567890"
+
+
+def create_request(
+    *,
+    request_id: str = "REQ-LINK-001",
+    status: RequestState = RequestState.CREATED,
+    token: str = VALID_TOKEN,
+    expires_at: datetime | None = None,
+) -> LocationRequestDocument:
+    """Create a request with a valid or expired share token."""
+    if expires_at is None:
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)
+
+    share_token = ShareTokenInfo(
+        token_hash=hashlib.sha256(token.encode("utf-8")).hexdigest(),
+        expires_at=expires_at,
+        is_used=False,
+    )
+
+    request = LocationRequestDocument.create_new(
+        request_id=request_id,
+        case_id="CASE-LINK-001",
+        target_phone_number="9876543210",
+        operator_code="JIO",
+        submitting_officer_id="officer-001",
+        share_token=share_token,
+    )
+
+    request.status = status
+    return request
+
+
+def seed_request(fake_database, request: LocationRequestDocument) -> None:
+    """Insert a request into the in-memory test database."""
+    fake_database.location_requests.documents.append(
+        request.model_dump(mode="json")
+    )
+
+
+def audit_event_types(fake_database) -> list[str]:
+    """Return the event types recorded in the audit collection."""
+    events = []
+
+    for document in fake_database.audit_logs.documents:
+        event_type = document["event_type"]
+
+        if hasattr(event_type, "value"):
+            event_type = event_type.value
+
+        events.append(str(event_type))
+
+    return events
+
+
+@pytest.mark.asyncio
+async def test_valid_link_moves_created_request_to_io_review(
+    async_client,
+    fake_database,
+):
+    request = create_request()
+    seed_request(fake_database, request)
+
+    response = await async_client.get(
+        f"/api/v1/request-links/{VALID_TOKEN}",
+        headers=IO_AUTH,
+    )
+
+    assert response.status_code == 200
+
+    body = response.json()
+    assert body["success"] is True
+    assert body["data"]["request_id"] == request.request_id
+    assert body["data"]["status"] == RequestState.PENDING_IO_REVIEW.value
+
+    stored = await fake_database.location_requests.find_one(
+        {"request_id": request.request_id}
+    )
+
+    assert stored["status"] == RequestState.PENDING_IO_REVIEW.value
+    assert stored["share_token"]["is_used"] is True
+    assert stored["share_token"]["used_at"] is not None
+
+    events = audit_event_types(fake_database)
+
+    assert AuditEventType.SHAREABLE_LINK_ACCESSED.value in events
+    assert AuditEventType.IO_REVIEW_STARTED.value in events
+
+
+@pytest.mark.asyncio
+async def test_share_link_cannot_be_redeemed_twice(
+    async_client,
+    fake_database,
+):
+    request = create_request()
+    seed_request(fake_database, request)
+
+    first_response = await async_client.get(
+        f"/api/v1/request-links/{VALID_TOKEN}",
+        headers=IO_AUTH,
+    )
+
+    assert first_response.status_code == 200
+
+    second_response = await async_client.get(
+        f"/api/v1/request-links/{VALID_TOKEN}",
+        headers=IO_AUTH,
+    )
+
+    assert second_response.status_code == 404
+
+    stored = await fake_database.location_requests.find_one(
+        {"request_id": request.request_id}
+    )
+
+    assert stored["share_token"]["is_used"] is True
+
+    # Only the first redemption should have generated audit events.
+    events = audit_event_types(fake_database)
+
+    assert events.count(AuditEventType.SHAREABLE_LINK_ACCESSED.value) == 1
+    assert events.count(AuditEventType.IO_REVIEW_STARTED.value) == 1
+
+
+@pytest.mark.asyncio
+async def test_expired_share_link_is_rejected(
+    async_client,
+    fake_database,
+):
+    expired_token = "expired-share-token-123456789012"
+    request = create_request(
+        request_id="REQ-LINK-EXPIRED",
+        token=expired_token,
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+    )
+    seed_request(fake_database, request)
+
+    response = await async_client.get(
+        f"/api/v1/request-links/{expired_token}",
+        headers=IO_AUTH,
+    )
+
+    assert response.status_code == 404
+
+    stored = await fake_database.location_requests.find_one(
+        {"request_id": request.request_id}
+    )
+
+    assert stored["status"] == RequestState.CREATED.value
+    assert stored["share_token"]["is_used"] is False
+    assert fake_database.audit_logs.documents == []
+
+
+@pytest.mark.asyncio
+async def test_invalid_share_token_is_rejected(
+    async_client,
+    fake_database,
+):
+    request = create_request()
+    seed_request(fake_database, request)
+
+    invalid_token = "invalid-share-token-123456789012"
+
+    response = await async_client.get(
+        f"/api/v1/request-links/{invalid_token}",
+        headers=IO_AUTH,
+    )
+
+    assert response.status_code == 404
+
+    stored = await fake_database.location_requests.find_one(
+        {"request_id": request.request_id}
+    )
+
+    assert stored["status"] == RequestState.CREATED.value
+    assert stored["share_token"]["is_used"] is False
+    assert fake_database.audit_logs.documents == []
+
+
+@pytest.mark.asyncio
+async def test_accessing_link_does_not_reset_existing_request_state(
+    async_client,
+    fake_database,
+):
+    token = "reviewed-share-token-123456789012"
+    request = create_request(
+        request_id="REQ-LINK-REVIEWED",
+        status=RequestState.PENDING_IO_REVIEW,
+        token=token,
+    )
+    seed_request(fake_database, request)
+
+    response = await async_client.get(
+        f"/api/v1/request-links/{token}",
+        headers=IO_AUTH,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["status"] == (
+        RequestState.PENDING_IO_REVIEW.value
+    )
+
+    stored = await fake_database.location_requests.find_one(
+        {"request_id": request.request_id}
+    )
+
+    assert stored["status"] == RequestState.PENDING_IO_REVIEW.value
+    assert stored["share_token"]["is_used"] is True
+
+    events = audit_event_types(fake_database)
+
+    assert events.count(AuditEventType.SHAREABLE_LINK_ACCESSED.value) == 1
+    assert AuditEventType.IO_REVIEW_STARTED.value not in events
+
+
+========== backend\tests\test_database.py ==========
+
+"""PostgreSQL connection and offline handling tests."""
+import pytest
+from backend.app.core.config import Settings
+from backend.app.core.database import DatabaseManager
+from backend.app.core.exceptions import DatabaseConnectionError
+
+
+@pytest.mark.asyncio
+async def test_database_manager_offline_graceful_handling():
+    
+    manager = DatabaseManager()
+    settings = Settings(
+        app_env="testing",
+        database_url="postgresql+psycopg://invalid:invalid@127.0.0.1:29999/ifso_test",
+        database_pool_timeout_seconds=1,
+    )
+    connected = await manager.connect(settings)
+    assert connected is False
+    assert manager.is_connected is False
+    assert (await manager.check_health())["status"] == "disconnected"
+    with pytest.raises(DatabaseConnectionError):
+        _ = manager.location_requests
+        
+    await manager.close()
+
+
+========== backend\tests\test_startup.py ==========
+
+"""Startup and Health Endpoint Tests."""
+
+import pytest
+from httpx import AsyncClient
+
+
+@pytest.mark.asyncio
+async def test_app_root_endpoint(async_client: AsyncClient):
+    """Verify root endpoint responds with basic system status and metadata."""
+    response = await async_client.get("/")
+    assert response.status_code == 200
+    data = response.json()
+    assert "status" in data
+    assert data["app"] == "IFSO Location Request Management System"
+    assert data["version"] == "0.1.0"
+    assert data["docs_url"] == "/docs"
+
+
+@pytest.mark.asyncio
+async def test_health_endpoint(async_client: AsyncClient):
+    """Verify v1 health endpoint responds with database diagnostics envelope."""
+    response = await async_client.get("/api/v1/health")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is True
+    assert "data" in payload
+    assert "status" in payload["data"]
+    assert "database" in payload["data"]
+
+
+@pytest.mark.asyncio
+async def test_openapi_schema_generation(async_client: AsyncClient):
+    """Verify FastAPI automatically generates valid OpenAPI specification."""
+    response = await async_client.get("/openapi.json")
+    assert response.status_code == 200
+    schema = response.json()
+    assert schema["info"]["title"] == "IFSO Location Request Management System"
+    assert schema["info"]["version"] == "0.1.0"
+    assert "/api/v1/health" in schema["paths"]
+    assert "/api/v1/requests" in schema["paths"]
+    assert "/api/v1/request-links/{token}" in schema["paths"]
+    assert "/api/v1/operators" in schema["paths"]
+
+
+@pytest.mark.asyncio
+async def test_phase3_execute_endpoint_requires_authentication(async_client: AsyncClient):
+    """Verify execute endpoint now enforces authentication."""
+    response = await async_client.post("/api/v1/requests/REQ-TEST-001/execute", json={})
+    assert response.status_code == 401
+    error_body = response.json()
+    assert error_body["success"] is False
+    assert error_body["error"]["code"] == "UNAUTHORIZED"
+
+
+========== backend\app\core\database.py ==========
+
+"""Async PostgreSQL persistence adapter.
+
+The adapter intentionally preserves the existing collection-style call surface used by
+routes while executing all persistence through SQLAlchemy 2.x and psycopg 3.
+Payloads retain the existing serialized Pydantic document shape; indexed relational
+columns enforce identifiers and support common lookups. Nested fields remain JSONB
+because they are existing structured lifecycle objects.
+"""
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Dict, Optional
+from sqlalchemy import (
+    MetaData, Table, Column, String, DateTime, Boolean, select, insert, update,
+    text, Index,
+)
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.exc import SQLAlchemyError
+
+from backend.app.core.config import Settings, get_settings
+from backend.app.core.exceptions import DatabaseConnectionError
+from backend.app.core.logging import get_logger
+
+logger = get_logger(__name__)
+metadata = MetaData()
+
+location_requests_table = Table(
+    "location_requests", metadata,
+    Column("request_id", String(80), primary_key=True),
+    Column("case_id", String(255), nullable=False),
+    Column("status", String(64), nullable=False, index=True),
+    Column("operator_code", String(32), nullable=False, index=True),
+    Column("submitting_officer_id", String(255), nullable=False, index=True),
+    Column("share_token_hash", String(64), unique=True, nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False, index=True),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    Column("payload", JSONB, nullable=False),
+)
+Index("ix_location_requests_status_created", location_requests_table.c.status, location_requests_table.c.created_at)
+
+operators_table = Table(
+    "operators", metadata,
+    Column("operator_code", String(32), primary_key=True),
+    Column("is_active", Boolean, nullable=False, server_default=text("true")),
+    Column("payload", JSONB, nullable=False),
+)
+audit_logs_table = Table(
+    "audit_logs", metadata,
+    Column("audit_id", String(80), primary_key=True),
+    Column("request_id", String(80), nullable=True),
+    Column("timestamp", DateTime(timezone=True), nullable=False, index=True),
+    Column("actor_id", String(255), nullable=False, index=True),
+    Column("event_type", String(80), nullable=False, index=True),
+    Column("payload", JSONB, nullable=False),
+)
+
+TABLES = {
+    "location_requests": location_requests_table,
+    "operators": operators_table,
+    "audit_logs": audit_logs_table,
+}
+
+def _nested(data: dict, path: str):
+    cur = data
+    for part in path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return None
+        cur = cur[part]
+    return cur
+
+def _matches(data: dict, query: dict) -> bool:
+    for key, expected in query.items():
+        if _nested(data, key) != expected:
+            return False
+    return True
+
+def _flatten_payload(payload: dict, table: Table) -> dict:
+    p = dict(payload)
+    if table is location_requests_table:
+        token = p.get("share_token") or {}
+        return {
+            "request_id": p["request_id"], "case_id": p["case_id"],
+            "status": getattr(p.get("status"), "value", p.get("status", "CREATED")),
+            "operator_code": p["operator_code"],
+            "submitting_officer_id": p["submitting_officer_id"],
+            "share_token_hash": token.get("token_hash"),
+            "created_at": _dt(p.get("created_at")), "updated_at": _dt(p.get("updated_at")),
+            "payload": p,
+        }
+    if table is operators_table:
+        return {"operator_code": p["operator_code"], "is_active": bool(p.get("is_active", True)), "payload": p}
+    return {
+        "audit_id": p["audit_id"], "request_id": p.get("request_id"),
+        "timestamp": _dt(p.get("timestamp")), "actor_id": p["actor_id"],
+        "event_type": getattr(p.get("event_type"), "value", p.get("event_type")),
+        "payload": p,
+    }
+
+def _dt(value):
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return value
+
+def _document(row):
+    if row is None:
+        return None
+    payload = dict(row["payload"])
+    return payload
+
+class AsyncCursor:
+    def __init__(self, collection, query):
+        self.collection, self.query, self.order = collection, query, None
+    def sort(self, key, direction):
+        self.order = (key, direction)
+        return self
+    def __aiter__(self):
+        async def iterator():
+            for item in await self.collection._find(self.query, self.order):
+                yield item
+        return iterator()
+
+class PostgresCollection:
+    def __init__(self, manager, name):
+        self.manager, self.name, self.table = manager, name, TABLES[name]
+    async def insert_one(self, document):
+        async with self.manager.sessions() as session:
+            async with session.begin():
+                await session.execute(insert(self.table).values(**_flatten_payload(document, self.table)))
+        return type("InsertResult", (), {"inserted_id": document.get("request_id", document.get("audit_id", document.get("operator_code")))})()
+    async def find_one(self, query, projection=None):
+        rows = await self._find(query, None, limit=1)
+        return rows[0] if rows else None
+    def find(self, query):
+        return AsyncCursor(self, query)
+    def _conditions(self, query):
+        conditions = []
+        for key, value in query.items():
+            mapped = {"share_token.token_hash": "share_token_hash"}.get(key, key)
+            if mapped in self.table.c:
+                conditions.append(self.table.c[mapped] == value)
+        return conditions
+
+    async def _find(self, query, order, limit=None):
+        async with self.manager.sessions() as session:
+            stmt = select(self.table).where(*self._conditions(query))
+            result = await session.execute(stmt)
+            docs = []
+            for row in result.mappings():
+                doc = _document(row)
+                if _matches(doc, query):
+                    docs.append(doc)
+            if order:
+                key, direction = order
+                docs.sort(key=lambda d: _nested(d, key) or "", reverse=direction < 0)
+            return docs[:limit] if limit else docs
+    async def update_one(self, query, update_doc):
+        # Serialize candidate selection/update in one transaction. Row-level locking
+        # prevents concurrent lifecycle transitions from overwriting one another.
+        async with self.manager.sessions() as session:
+            async with session.begin():
+                stmt = select(self.table).where(*self._conditions(query)).with_for_update()
+                result = await session.execute(stmt)
+                for row in result.mappings():
+                    doc = _document(row)
+                    if not _matches(doc, query):
+                        continue
+                    for path, value in update_doc.get("$set", {}).items():
+                        cur = doc
+                        parts = path.split(".")
+                        for part in parts[:-1]:
+                            if not isinstance(cur.get(part), dict):
+                                cur[part] = {}
+                            cur = cur[part]
+                        cur[parts[-1]] = value.isoformat() if isinstance(value, datetime) else value
+                    vals = _flatten_payload(doc, self.table)
+                    key_col = list(self.table.primary_key.columns)[0]
+                    key = row[key_col.name]
+                    await session.execute(update(self.table).where(key_col == key).values(**vals))
+                    return type("UpdateResult", (), {"modified_count": 1})()
+        return type("UpdateResult", (), {"modified_count": 0})()
+
+class DatabaseManager:
+    def __init__(self):
+        self.engine: Optional[AsyncEngine] = None
+        self.sessions = None
+        self.is_connected = False
+        self._collections = {name: PostgresCollection(self, name) for name in TABLES}
+    async def connect(self, settings: Optional[Settings] = None) -> bool:
+        cfg = settings or get_settings()
+        try:
+            self.engine = create_async_engine(
+                cfg.database_url,
+                pool_size=cfg.database_pool_size,
+                max_overflow=cfg.database_max_overflow,
+                pool_timeout=cfg.database_pool_timeout_seconds,
+                pool_pre_ping=True,
+            )
+            self.sessions = async_sessionmaker(self.engine, expire_on_commit=False, class_=AsyncSession)
+            async with self.engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+            self.is_connected = True
+            logger.info("Connected to PostgreSQL.")
+            return True
+        except Exception as exc:
+            self.is_connected = False
+            logger.warning("PostgreSQL unavailable (%s); running in degraded/offline mode.", type(exc).__name__)
+            return False
+    async def close(self):
+        if self.engine is not None:
+            await self.engine.dispose()
+        self.engine = None
+        self.sessions = None
+        self.is_connected = False
+    async def check_health(self) -> Dict[str, Any]:
+        if self.engine is None or self.sessions is None:
+            return {"status": "disconnected", "message": "Database engine has not been initialized."}
+        try:
+            async with self.engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+            self.is_connected = True
+            return {"status": "connected", "database": get_settings().database_name}
+        except Exception as exc:
+            self.is_connected = False
+            return {"status": "disconnected", "message": f"Connection check failed: {type(exc).__name__}"}
+    def get_database(self):
+        if not self.is_connected or self.sessions is None:
+            raise DatabaseConnectionError("PostgreSQL database is not initialized or unavailable.")
+        return self
+    @property
+    def location_requests(self):
+        db = self.get_database()
+        return db._collections["location_requests"] if db is self else db["location_requests"]
+    @property
+    def operators(self):
+        db = self.get_database()
+        return db._collections["operators"] if db is self else db["operators"]
+    @property
+    def audit_logs(self):
+        db = self.get_database()
+        return db._collections["audit_logs"] if db is self else db["audit_logs"]
+
+db_manager = DatabaseManager()
+async def get_database():
+    return db_manager.get_database()
+
+
+========== backend\app\core\config.py ==========
+
+"""Application Configuration Module.
+
+Loads settings from environment variables and provides centralized access
+using pydantic-settings.
+"""
+
+from functools import lru_cache
+from typing import Dict, Literal, Optional
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pathlib import Path 
+
+class Settings(BaseSettings):
+    """Core application settings."""
+
+    model_config = SettingsConfigDict(
+      env_file=Path(__file__).resolve().parents[2] / ".env",
+      env_file_encoding="utf-8",
+      extra="ignore",
+    )
+
+    # Application metadata
+    app_name: str = Field(
+        default="IFSO Location Request Management System",
+        description="Application title",
+    )
+    app_env: Literal["development", "testing", "staging", "production"] = Field(
+        default="development",
+        description="Application environment",
+    )
+    app_debug: bool = Field(
+        default=True,
+        description="Debug flag for development",
+    )
+    app_version: str = Field(
+        default="0.1.0",
+        description="Current application version",
+    )
+    log_level: str = Field(
+        default="INFO",
+        description="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)",
+    )
+
+    # API Server configuration
+    host: str = Field(default="0.0.0.0", description="Bind host")
+    port: int = Field(default=8000, description="Bind port")
+    api_v1_prefix: str = Field(default="/api/v1", description="API v1 route prefix")
+
+    # PostgreSQL configuration
+    database_url: str = Field(
+        default="postgresql+psycopg://localhost:5432/ifso_location",
+        description="SQLAlchemy async PostgreSQL URL; provide via DATABASE_URL.",
+    )
+    database_name: str = Field(default="ifso_location", description="Logical database name for health reporting")
+    database_pool_size: int = Field(default=10, description="SQLAlchemy connection pool size")
+    database_max_overflow: int = Field(default=20, description="Maximum overflow connections")
+    database_pool_timeout_seconds: int = Field(default=3, description="Pool checkout timeout in seconds")
+
+    # Security configuration (Phase 2+ Auth Placeholder)
+    secret_key: str = Field(
+        default="insecure-dev-key-change-in-production-only-for-local-testing",
+        description="Secret key for signing / cryptographic operations",
+    )
+    access_token_expire_minutes: int = Field(
+        default=60,
+        description="Access token lifespan in minutes",
+    )
+    auth_mode: Literal["development_static", "external"] = Field(
+        default="development_static",
+        description=(
+            "Authentication boundary. development_static is allowed only for "
+            "development/testing; production must use an external identity provider."
+        ),
+    )
+    development_auth_tokens: Dict[str, str] = Field(
+        default_factory=lambda: {
+            "dev-officer-token": "OFFICER-DEV-001:OFFICER",
+            "dev-io-token": "IO-DEV-001:IO",
+            "dev-admin-token": "ADMIN-DEV-001:ADMIN",
+        },
+        description=(
+            "Development-only bearer token mapping: token -> principal_id:ROLE. "
+            "Never use as production authentication."
+        ),
+    )
+    field_encryption_key: Optional[str] = Field(
+        default=None,
+        description=(
+            "Fernet key used for reversible encryption of sensitive fields. "
+            "Required outside development/testing."
+        ),
+    )
+
+    # Operational lifecycle configuration
+    request_token_expire_hours: int = Field(
+        default=24,
+        description="Shareable token expiration window in hours",
+    )
+    sms_timeout_minutes: int = Field(
+        default=5,
+        description="Awaiting response timeout window in minutes",
+    )
+    max_sms_retries: int = Field(
+        default=2,
+        description="Maximum retry attempts on SMS transmission failure",
+    )
+
+
+@lru_cache
+def get_settings() -> Settings:
+    """Return cached application settings singleton."""
+    return Settings()
+
+
+========== backend\app\main.py ==========
+
+"""FastAPI Application Entrypoint for IFSO Location Request Management System.
+
+Configures lifespan lifecycle events, logging, database connections, CORS,
+exception handlers, and API routing.
+"""
+
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
+from fastapi import FastAPI, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from backend.app.core.config import get_settings
+from backend.app.core.database import db_manager
+from backend.app.core.exceptions import register_exception_handlers
+from backend.app.core.logging import get_logger, setup_logging
+from backend.app.routes.api import api_v1_router
+
+logger = get_logger("app.main")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Application lifespan manager for startup and shutdown routines."""
+    settings = get_settings()
+
+    # Configure structured redacting logger
+    setup_logging(log_level=settings.log_level)
+    logger.info(
+        f"Starting {settings.app_name} [v{settings.app_version}] "
+        f"in '{settings.app_env}' environment (debug={settings.app_debug})."
+    )
+
+    # Attempt database connection
+    await db_manager.connect(settings)
+
+    yield
+
+    # Teardown database connection pool
+    logger.info("Initiating graceful shutdown...")
+    await db_manager.close()
+    logger.info("Application shutdown complete.")
+
+
+def create_application() -> FastAPI:
+    """Application factory for FastAPI instance."""
+    settings = get_settings()
+
+    app = FastAPI(
+        title=settings.app_name,
+        description=(
+            "REST API for the IFSO Location Request Management System. "
+            "Automates authorized SMS location queries with tamper-evident audit trails."
+        ),
+        version=settings.app_version,
+        docs_url="/docs",
+        redoc_url="/redoc",
+        openapi_url="/openapi.json",
+        lifespan=lifespan,
+        debug=settings.app_debug,
+    )
+
+    # CORS configuration for development and mobile clients
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # Register centralized exception handlers
+    register_exception_handlers(app)
+
+    # Root health check endpoint
+    @app.get(
+        "/",
+        tags=["System & Health"],
+        status_code=status.HTTP_200_OK,
+        summary="Root health and metadata endpoint",
+    )
+    async def root_status() -> JSONResponse:
+        db_health = await db_manager.check_health()
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "status": "healthy" if db_health.get("status") == "connected" else "degraded",
+                "app": settings.app_name,
+                "version": settings.app_version,
+                "environment": settings.app_env,
+                "database_status": db_health.get("status"),
+                "docs_url": "/docs",
+                "api_v1": settings.api_v1_prefix,
+            },
+        )
+
+    # Register API routes under v1 prefix
+    app.include_router(api_v1_router, prefix=settings.api_v1_prefix)
+
+    return app
+
+
+# Application singleton for ASGI servers (uvicorn backend.app.main:app)
+app = create_application()

@@ -5,7 +5,9 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from backend.app.main import app
+from backend.app.core.field_crypto import decrypt_sensitive_text
 from backend.app.models.location_request import LocationRequestDocument
+from backend.tests.conftest import fetch_all_documents
 from backend.tests.test_requests_phase2 import (
     ADMIN_AUTH,
     IO_AUTH,
@@ -17,9 +19,9 @@ from backend.tests.test_requests_phase2 import (
 
 @pytest.mark.asyncio
 async def test_execute_request_returns_dispatch_instructions(
-    async_client: AsyncClient, fake_database
+    async_client: AsyncClient, postgres_database
 ):
-    request_id = await _create_pending_request(async_client, fake_database)
+    request_id = await _create_pending_request(async_client, postgres_database)
 
     execute_response = await async_client.post(
         f"/api/v1/requests/{request_id}/execute",
@@ -33,17 +35,17 @@ async def test_execute_request_returns_dispatch_instructions(
     assert "dispatch_instructions" in payload["data"]
 
     instructions = payload["data"]["dispatch_instructions"]
-    assert instructions["service_number"] == "1512"
+    assert instructions["service_number"] == "TEST-SERVICE-NUMBER"
     assert instructions["operator_code"] == "JIO"
     assert instructions["sim_slot_index"] == 0
-    assert instructions["sms_body"] == "LOC +919876543210"
+    assert instructions["sms_body"] == "TEST-COMMAND +919876543210"
 
 
 @pytest.mark.asyncio
 async def test_record_send_status_success_transitions_to_waiting_response(
-    async_client: AsyncClient, fake_database
+    async_client: AsyncClient, postgres_database
 ):
-    request_id = await _create_pending_request(async_client, fake_database)
+    request_id = await _create_pending_request(async_client, postgres_database)
 
     # First execute
     await async_client.post(
@@ -63,10 +65,8 @@ async def test_record_send_status_success_transitions_to_waiting_response(
     assert payload["success"] is True
     assert payload["data"]["status"] == "WAITING_RESPONSE"
 
-    stored = next(
-        doc
-        for doc in fake_database.location_requests.documents
-        if doc["request_id"] == request_id
+    stored = await postgres_database.location_requests.find_one(
+        {"request_id": request_id}
     )
     assert stored["status"] == "WAITING_RESPONSE"
     assert stored["execution_info"]["delivery_status"] == "SENT"
@@ -76,15 +76,15 @@ async def test_record_send_status_success_transitions_to_waiting_response(
         audit["event_type"] == "SMS_DISPATCHED"
         and audit["request_id"] == request_id
         and audit["actor_id"] == "IO-DEV-001"
-        for audit in fake_database.audit_logs.documents
+        for audit in await fetch_all_documents(postgres_database.audit_logs)
     )
 
 
 @pytest.mark.asyncio
 async def test_record_send_status_failure_transitions_to_sms_failed(
-    async_client: AsyncClient, fake_database
+    async_client: AsyncClient, postgres_database
 ):
-    request_id = await _create_pending_request(async_client, fake_database)
+    request_id = await _create_pending_request(async_client, postgres_database)
 
     # Execute
     await async_client.post(
@@ -107,10 +107,8 @@ async def test_record_send_status_failure_transitions_to_sms_failed(
     assert payload["success"] is True
     assert payload["data"]["status"] == "SMS_FAILED"
 
-    stored = next(
-        doc
-        for doc in fake_database.location_requests.documents
-        if doc["request_id"] == request_id
+    stored = await postgres_database.location_requests.find_one(
+        {"request_id": request_id}
     )
     assert stored["status"] == "SMS_FAILED"
     assert stored["execution_info"]["last_error"] == "Radio off: No cellular coverage"
@@ -120,15 +118,15 @@ async def test_record_send_status_failure_transitions_to_sms_failed(
         audit["event_type"] == "SMS_FAILED"
         and audit["request_id"] == request_id
         and audit["actor_id"] == "IO-DEV-001"
-        for audit in fake_database.audit_logs.documents
+        for audit in await fetch_all_documents(postgres_database.audit_logs)
     )
 
 
 @pytest.mark.asyncio
 async def test_record_send_status_rejects_non_executing_state(
-    async_client: AsyncClient, fake_database
+    async_client: AsyncClient, postgres_database
 ):
-    request_id = await _create_pending_request(async_client, fake_database)
+    request_id = await _create_pending_request(async_client, postgres_database)
 
     # Try to report send status while still in PENDING_IO_REVIEW
     send_response = await async_client.post(
@@ -142,9 +140,9 @@ async def test_record_send_status_rejects_non_executing_state(
 
 @pytest.mark.asyncio
 async def test_submit_result_success_preserves_raw_sms_and_completes(
-    async_client: AsyncClient, fake_database
+    async_client: AsyncClient, postgres_database
 ):
-    request_id = await _create_pending_request(async_client, fake_database)
+    request_id = await _create_pending_request(async_client, postgres_database)
 
     # Execute
     await async_client.post(
@@ -168,7 +166,7 @@ async def test_submit_result_success_preserves_raw_sms_and_completes(
         f"/api/v1/requests/{request_id}/result",
         json={
             "raw_sms_content": raw_telecom_sms,
-            "sender_address": "1512",
+            "sender_address": "TEST-RESPONSE-SENDER",
         },
         headers=IO_AUTH,
     )
@@ -178,36 +176,37 @@ async def test_submit_result_success_preserves_raw_sms_and_completes(
     assert payload["data"]["status"] == "COMPLETED"
     assert payload["data"]["raw_hash_sha256"] == expected_hash
 
-    stored = next(
-        doc
-        for doc in fake_database.location_requests.documents
-        if doc["request_id"] == request_id
+    stored = await postgres_database.location_requests.find_one(
+        {"request_id": request_id}
     )
     assert stored["status"] == "COMPLETED"
-    assert stored["response_info"]["raw_sms_content"] == raw_telecom_sms
+    encrypted_raw = stored["response_info"]["raw_sms_content_encrypted"]
+    assert encrypted_raw and encrypted_raw != raw_telecom_sms
+    assert stored["response_info"]["raw_sms_content"] is None
+    assert decrypt_sensitive_text(encrypted_raw) == raw_telecom_sms
     assert stored["response_info"]["raw_hash_sha256"] == expected_hash
-    assert stored["response_info"]["sender_address"] == "1512"
+    assert stored["response_info"]["sender_address"] == "TEST-RESPONSE-SENDER"
 
     # Audit log verification: raw content is NOT in audit logs, but hash and sender are
     assert any(
         audit["event_type"] == "SMS_RESPONSE_RECEIVED"
         and audit["request_id"] == request_id
         and audit["details"]["raw_hash_sha256"] == expected_hash
-        and audit["details"]["sender_address"] == "1512"
-        for audit in fake_database.audit_logs.documents
+        and audit["details"]["sender_address"] == "TEST-RESPONSE-SENDER"
+        for audit in await fetch_all_documents(postgres_database.audit_logs)
     )
     assert any(
         audit["event_type"] == "REQUEST_COMPLETED"
         and audit["request_id"] == request_id
-        for audit in fake_database.audit_logs.documents
+        for audit in await fetch_all_documents(postgres_database.audit_logs)
     )
 
 
 @pytest.mark.asyncio
 async def test_phase3_role_authorization(
-    async_client: AsyncClient, fake_database
+    async_client: AsyncClient, postgres_database
 ):
-    request_id = await _create_pending_request(async_client, fake_database)
+    request_id = await _create_pending_request(async_client, postgres_database)
 
     # OFFICER forbidden from send-status
     officer_send = await async_client.post(

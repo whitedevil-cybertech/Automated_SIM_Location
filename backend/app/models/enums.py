@@ -81,6 +81,7 @@ class UserRole(str, Enum):
     OFFICER = "OFFICER"
     IO = "IO"  # Investigating Officer
     ADMIN = "ADMIN"
+    SYSTEM = "SYSTEM"  # Non-interactive service actor used only in audit records
 
 
 class AuditEventType(str, Enum):
@@ -88,6 +89,7 @@ class AuditEventType(str, Enum):
 
     REQUEST_CREATED = "REQUEST_CREATED"
     SHAREABLE_LINK_ACCESSED = "SHAREABLE_LINK_ACCESSED"
+    SHAREABLE_LINK_CREATED = "SHAREABLE_LINK_CREATED"
     IO_REVIEW_STARTED = "IO_REVIEW_STARTED"
     EXECUTION_TRIGGERED = "EXECUTION_TRIGGERED"
     SMS_DISPATCHED = "SMS_DISPATCHED"

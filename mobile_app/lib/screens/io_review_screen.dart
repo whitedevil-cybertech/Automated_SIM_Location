@@ -1,4 +1,6 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../core/constants/request_states.dart';
 import '../core/theme/color_schemes.dart';
@@ -21,9 +23,7 @@ class IoReviewScreen extends StatefulWidget {
   final LocationRequest request;
   final ApiService apiService;
 
-  /// Retained for compatibility with existing callers.
-  ///
-  /// This screen does not perform telephony operations.
+  /// Android telephony bridge for authorized SMS dispatch and response capture.
   final dynamic telephonyBridge;
 
   final String ioDeviceId;
@@ -37,7 +37,21 @@ class _IoReviewScreenState extends State<IoReviewScreen> {
   late RequestState _currentStatus;
 
   bool _isExecuting = false;
-  bool _executionSuccessful = false;
+  bool _authorizationRecorded = false;
+  bool _smsDispatchAccepted = false;
+  bool _dispatchOutcomeUnknown = false;
+  bool _executionOutcomeUnknown = false;
+  bool _sendStatusSyncPending = false;
+  bool? _pendingSendStatusSuccess;
+  String? _pendingDeliveryStatus;
+  String? _pendingSendError;
+  StreamSubscription<dynamic>? _smsSubscription;
+  String? _expectedSender;
+  String? _rawResponse;
+  String? _responseSender;
+  DateTime? _responseReceivedAt;
+  String? _responseHash;
+  dynamic _earlySmsEvent;
 
   String? _errorMessage;
   String? _workflowMessage;
@@ -48,12 +62,23 @@ class _IoReviewScreenState extends State<IoReviewScreen> {
     _currentStatus = widget.request.status;
   }
 
+  @override
+  void dispose() {
+    _smsSubscription?.cancel();
+    super.dispose();
+  }
+
+  bool get _canStartExecution =>
+      mounted &&
+      !_isExecuting &&
+      !_authorizationRecorded &&
+      !_smsDispatchAccepted &&
+      !_dispatchOutcomeUnknown &&
+      !_executionOutcomeUnknown &&
+      _currentStatus == RequestState.pendingIoReview;
+
   Future<void> _confirmExecution() async {
-    if (_isExecuting ||
-        _executionSuccessful ||
-        _currentStatus != RequestState.pendingIoReview) {
-      return;
-    }
+    if (!_canStartExecution) return;
 
     final confirmed = await showDialog<bool>(
       context: context,
@@ -63,20 +88,16 @@ class _IoReviewScreenState extends State<IoReviewScreen> {
           content: const Text(
             'Confirm that this request has been reviewed and is '
             'authorized to proceed through the approved workflow.\n\n'
-            'This action records execution authorization. It does not '
-            'send SMS messages or retrieve a device location.',
+            'After confirmation, the app may send an SMS from this device only '
+            'when approved operator configuration and required permissions exist.',
           ),
           actions: [
             TextButton(
-              onPressed: () {
-                Navigator.of(dialogContext).pop(false);
-              },
+              onPressed: () => Navigator.of(dialogContext).pop(false),
               child: const Text('Cancel'),
             ),
             FilledButton(
-              onPressed: () {
-                Navigator.of(dialogContext).pop(true);
-              },
+              onPressed: () => Navigator.of(dialogContext).pop(true),
               child: const Text('Confirm'),
             ),
           ],
@@ -84,81 +105,319 @@ class _IoReviewScreenState extends State<IoReviewScreen> {
       },
     );
 
-    if (confirmed != true || !mounted) {
-      return;
-    }
-
+    if (confirmed != true || !mounted) return;
     await _executeRequest();
   }
 
   Future<void> _executeRequest() async {
-    if (_isExecuting || _executionSuccessful || !mounted) {
-      return;
-    }
+    if (!_canStartExecution) return;
 
-    if (_currentStatus != RequestState.pendingIoReview) {
+    final bridge = widget.telephonyBridge;
+    if (bridge == null) {
+      setState(() {
+        _errorMessage = 'Android SMS bridge is unavailable. No SMS was sent.';
+        _workflowMessage = null;
+      });
       return;
     }
 
     setState(() {
       _isExecuting = true;
       _errorMessage = null;
-      _workflowMessage = 'Recording execution authorization...';
+      _workflowMessage =
+          'Checking SMS permissions and approved operator configuration...';
     });
 
     try {
-      await widget.apiService.executeLocationRequest(
+      final permissionGranted = await bridge.checkSmsPermission();
+      if (!permissionGranted) {
+        final granted = await bridge.requestSmsPermission();
+        if (!granted) {
+          throw const ApiException(
+            statusCode: 403,
+            code: 'SMS_PERMISSION_DENIED',
+            message: 'SMS permissions were denied by the device or device policy.',
+          );
+        }
+      }
+
+      setState(() {
+        _workflowMessage = 'Requesting execution authorization from the server...';
+      });
+      final execution = await widget.apiService.executeLocationRequest(
         requestId: widget.request.requestId,
         ioDeviceId: widget.ioDeviceId,
         simSlotIndex: widget.simSlotIndex,
       );
 
-      if (!mounted) {
-        return;
-      }
-
+      // The backend has accepted execution. From this point, never restart the
+      // whole workflow from this screen; retries must not call the SMS bridge again.
       setState(() {
-        _isExecuting = false;
-        _executionSuccessful = true;
+        _authorizationRecorded = true;
         _currentStatus = RequestState.executing;
-        _workflowMessage = 'Execution authorization recorded. '
-            'No SMS was sent by this screen.';
+        _workflowMessage = 'Authorization recorded. Validating approved dispatch instructions...';
       });
 
-      _showMessage(
-        'Execution authorization recorded successfully.',
+      final data = execution['data'];
+      if (data is! Map || data['dispatch_instructions'] is! Map) {
+        throw const ApiException(
+          statusCode: 500,
+          code: 'INVALID_DISPATCH_INSTRUCTIONS',
+          message: 'The server returned invalid dispatch instructions. Do not retry; reconcile the request status first.',
+        );
+      }
+      final instructions = Map<String, dynamic>.from(data['dispatch_instructions'] as Map);
+      final destination = instructions['service_number'] as String? ?? '';
+      final message = instructions['sms_body'] as String? ?? '';
+      final responseSender = instructions['response_sender'] as String? ?? '';
+      if (destination.trim().isEmpty || message.trim().isEmpty || responseSender.trim().isEmpty) {
+        throw const ApiException(
+          statusCode: 500,
+          code: 'INVALID_DISPATCH_INSTRUCTIONS',
+          message: 'Approved operator configuration is incomplete. No SMS was sent; the authorized request requires review.',
+        );
+      }
+      _expectedSender = responseSender;
+
+      await _smsSubscription?.cancel();
+      _smsSubscription = bridge.onSmsReceived.listen(_handleSmsEvent);
+
+      setState(() {
+        // A platform/channel exception can occur after Android accepted the SMS.
+        // Treat the outcome as unknown until sendSms returns a definitive result.
+        _dispatchOutcomeUnknown = true;
+        _workflowMessage = 'Submitting the SMS to Android. Do not retry while the outcome is unknown...';
+      });
+      final sent = await bridge.sendSms(
+        requestId: widget.request.requestId,
+        destinationAddress: destination,
+        message: message,
+        simSlotIndex: widget.simSlotIndex,
       );
+
+      setState(() {
+        _dispatchOutcomeUnknown = false;
+        _smsDispatchAccepted = sent.success;
+        _currentStatus = sent.success
+            ? RequestState.waitingResponse
+            : RequestState.smsFailed;
+        _sendStatusSyncPending = true;
+        _pendingSendStatusSuccess = sent.success;
+        _pendingDeliveryStatus = sent.deliveryStatus;
+        _pendingSendError = sent.errorMessage ?? sent.errorCode;
+        _workflowMessage = sent.success
+            ? 'Android accepted the SMS for dispatch. This is not proof of carrier delivery or a location result.'
+            : 'Android reported that the SMS was not sent. The failure will be recorded; do not restart this request from this screen.';
+      });
+
+      // Status synchronization is deliberately separate from SMS dispatch.
+      // A synchronization failure must never cause the SMS to be sent again.
+      await _synchronizeSendStatus();
+
+      if (sent.success && !_sendStatusSyncPending) {
+        final earlyEvent = _earlySmsEvent;
+        _earlySmsEvent = null;
+        if (earlyEvent != null && mounted) {
+          await _handleSmsEvent(earlyEvent);
+        }
+      }
     } on ApiException catch (error) {
-      if (!mounted) {
-        return;
-      }
-
-      final message = _userFacingErrorMessage(error);
-
+      if (!mounted) return;
+      final uncertainServerOutcome = !_authorizationRecorded &&
+          (error.isNetworkError || error.statusCode == 0 || error.statusCode >= 500);
       setState(() {
         _isExecuting = false;
-        _errorMessage = message;
-        _workflowMessage = null;
+        if (_dispatchOutcomeUnknown) {
+          _errorMessage =
+              'SMS dispatch outcome is unknown. Do not retry or resend. Verify the device and request audit state before taking further action.';
+          _workflowMessage = null;
+        } else if (uncertainServerOutcome) {
+          _executionOutcomeUnknown = true;
+          _errorMessage =
+              'The server outcome could not be confirmed. Do not retry execution until the request state has been verified.';
+          _workflowMessage = null;
+        } else {
+          _errorMessage = _userFacingErrorMessage(error);
+          _workflowMessage = null;
+        }
       });
-
-      // The inline workflow status card presents the error. Avoid showing
-      // the same message a second time in a SnackBar.
     } catch (_) {
-      if (!mounted) {
-        return;
-      }
-
-      const message = 'Unable to record execution authorization. '
-          'Check the service connection and try again.';
-
+      if (!mounted) return;
       setState(() {
         _isExecuting = false;
-        _errorMessage = message;
+        if (_dispatchOutcomeUnknown) {
+          _errorMessage =
+              'SMS dispatch outcome is unknown. Do not retry or resend. Verify the device and request audit state before taking further action.';
+          _workflowMessage = null;
+        } else if (_authorizationRecorded) {
+          _errorMessage =
+              'Execution authorization was recorded, but dispatch could not be confirmed. Do not restart execution; reconcile the request state.';
+          _workflowMessage = null;
+        } else {
+          _errorMessage =
+              'The request could not be completed. Check configuration, permissions, and connection before retrying.';
+          _workflowMessage = null;
+        }
+      });
+    } finally {
+      if (mounted && _isExecuting) {
+        setState(() => _isExecuting = false);
+      }
+    }
+  }
+
+  Future<void> _synchronizeSendStatus() async {
+    final success = _pendingSendStatusSuccess;
+    if (success == null) return;
+    final sendError = _pendingSendError;
+
+    try {
+      await widget.apiService.updateSendStatus(
+        requestId: widget.request.requestId,
+        success: success,
+        deliveryStatus: _pendingDeliveryStatus,
+        errorMessage: _pendingSendError,
+      );
+      if (!mounted) return;
+      setState(() {
+        _sendStatusSyncPending = false;
+        _pendingSendStatusSuccess = null;
+        _pendingDeliveryStatus = null;
+        _pendingSendError = null;
+        _errorMessage = null;
+        if (success) {
+          _workflowMessage =
+              'SMS dispatch status was recorded. Waiting for the carrier response; delivery and location are not yet confirmed.';
+        } else {
+          _errorMessage = sendError ?? 'Android reported that the SMS was not sent.';
+          _workflowMessage = null;
+        }
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _sendStatusSyncPending = true;
+        _errorMessage = success
+            ? 'Android accepted the SMS, but the backend could not confirm the dispatch status. Do not resend the SMS; use “Retry Status Sync”.'
+            : 'Android reported an SMS failure, but the backend could not record it. Do not restart execution; use “Retry Status Sync”.';
         _workflowMessage = null;
       });
+    }
+  }
 
-      // The inline workflow status card presents the error. Avoid showing
-      // the same message a second time in a SnackBar.
+  Future<void> _retrySendStatusSync() async {
+    if (!_sendStatusSyncPending || _isExecuting || !mounted) return;
+    setState(() {
+      _isExecuting = true;
+      _errorMessage = null;
+      _workflowMessage = 'Retrying status synchronization only. No SMS will be sent.';
+    });
+    try {
+      await _synchronizeSendStatus();
+      if (!_sendStatusSyncPending && _smsDispatchAccepted) {
+        final earlyEvent = _earlySmsEvent;
+        _earlySmsEvent = null;
+        if (earlyEvent != null && mounted) {
+          await _handleSmsEvent(earlyEvent);
+        }
+      }
+    } finally {
+      if (mounted) setState(() => _isExecuting = false);
+    }
+  }
+
+  String _userFacingErrorMessage(ApiException error) {
+    switch (error.code) {
+      case 'UNAUTHORIZED':
+        return 'Your session is not authorized.';
+      case 'FORBIDDEN':
+        return 'You are not authorized to execute this request.';
+      case 'INVALID_STATE_TRANSITION':
+        return 'The request is no longer awaiting IO review.';
+      case 'SMS_PERMISSION_DENIED':
+        return 'SMS permissions were denied by the device or device policy.';
+      case 'VALIDATION_ERROR':
+        // ApiService already maps known operator validation errors. Do not
+        // mislabel every validation error as an inactive operator.
+        return error.message.isNotEmpty
+            ? error.message
+            : 'The submitted request data could not be validated.';
+      case 'NETWORK_ERROR':
+        return error.message.isNotEmpty
+            ? error.message
+            : 'Unable to communicate with the server.';
+      default:
+        final message = error.message.trim();
+        return message.isEmpty
+            ? 'Unable to record execution authorization.'
+            : message;
+    }
+  }
+
+  Future<void> _handleSmsEvent(dynamic event) async {
+    final bridge = widget.telephonyBridge;
+    if (bridge == null || _expectedSender == null || _expectedSender!.trim().isEmpty) {
+      return;
+    }
+    if (!bridge.isCorrelatedResponse(
+      event: event,
+      expectedSender: _expectedSender!,
+      expectedRequestId: widget.request.requestId,
+    )) {
+      return;
+    }
+    if (_sendStatusSyncPending) {
+      if (_pendingSendStatusSuccess == true) _earlySmsEvent = event;
+      return;
+    }
+    if (_currentStatus != RequestState.waitingResponse) {
+      if (_currentStatus == RequestState.executing) _earlySmsEvent = event;
+      return;
+    }
+
+    try {
+      final response = await widget.apiService.submitResult(
+        requestId: widget.request.requestId,
+        rawSmsContent: event.body as String,
+        senderAddress: event.sender as String,
+        receivedAt: (event.timestamp as DateTime).toUtc(),
+      );
+      final responseData = response['data'];
+      if (!mounted) return;
+      setState(() {
+        _rawResponse = event.body as String;
+        _responseSender = event.sender as String;
+        _responseReceivedAt = (event.timestamp as DateTime).toUtc();
+        _responseHash = responseData is Map
+            ? responseData['raw_hash_sha256'] as String?
+            : null;
+        _currentStatus = RequestState.completed;
+        _workflowMessage = 'Response received and recorded. Review the raw response before sharing.';
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _errorMessage = 'SMS received, but the backend could not confirm that it was recorded. Preserve the message and retry submission.';
+      });
+    }
+  }
+
+  Future<void> _copyResponseForAuthorizedSharing() async {
+    final response = _rawResponse;
+    if (response == null || response.isEmpty) return;
+    final report = 'IFSO Location Request Result\n'
+        'Request ID: ${widget.request.requestId}\n'
+        'Case ID: ${widget.request.caseId}\n'
+        'Operator: ${widget.request.operatorCode}\n'
+        'Received at: ${_responseReceivedAt?.toIso8601String() ?? "unknown"}\n'
+        'Sender: ${_responseSender ?? "unknown"}\n'
+        'SHA-256: ${_responseHash ?? "not returned by backend"}\n'
+        'Raw SMS response (unparsed evidence):\n$response';
+    final bridge = widget.telephonyBridge;
+    if (bridge == null || !await bridge.shareText(report)) {
+      await Clipboard.setData(ClipboardData(text: report));
+      if (mounted) _showMessage('Share chooser unavailable. Result report copied; share only through an approved channel.');
+      return;
     }
   }
 
@@ -176,69 +435,49 @@ class _IoReviewScreenState extends State<IoReviewScreen> {
       );
   }
 
-  String _userFacingErrorMessage(ApiException error) {
-    // Prefer stable, user-facing text for known API error codes. Some
-    // ApiService implementations expose a generic message for 422 responses,
-    // so handle VALIDATION_ERROR by code rather than relying only on the
-    // server message string.
-    switch (error.code) {
-      case 'UNAUTHORIZED':
-        return 'Your session is not authorized.';
-      case 'FORBIDDEN':
-        return 'You are not authorized to execute this request.';
-      case 'INVALID_STATE_TRANSITION':
-        return 'The request is no longer awaiting IO review.';
-      case 'VALIDATION_ERROR':
-        return 'Operator is not approved or currently inactive.';
-      default:
-        final message = error.message.trim();
-
-        // Fallback for API implementations that don't populate error.code.
-        switch (message) {
-          case 'Authentication required.':
-          case 'Unauthorized':
-            return 'Your session is not authorized.';
-          case 'Insufficient permissions.':
-            return 'You are not authorized to execute this request.';
-          case 'Invalid request state.':
-            return 'The request is no longer awaiting IO review.';
-          default:
-            return message.isEmpty
-                ? 'Unable to record execution authorization.'
-                : message;
-        }
-    }
-  }
-
   Widget _buildWorkflowStatus(ThemeData theme) {
     final message = _errorMessage ?? _workflowMessage;
-
-    if (message == null || message.isEmpty) {
+    if ((message == null || message.isEmpty) && !_sendStatusSyncPending) {
       return const SizedBox.shrink();
     }
-
     final hasError = _errorMessage != null;
-
     return Card(
       key: const ValueKey('workflow-status-card'),
       color: hasError ? AppColors.errorContainer : AppColors.infoContainer,
       child: Padding(
         padding: const EdgeInsets.all(AppSpacing.space3),
-        child: Row(
+        child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Icon(
-              hasError ? Icons.error_outline : Icons.info_outline,
-              color: hasError ? AppColors.error : AppColors.info,
-            ),
-            const SizedBox(width: AppSpacing.space2),
-            Expanded(
-              child: Text(
-                message,
-                key: const ValueKey('workflow-status-message'),
-                style: theme.textTheme.bodyMedium,
+            if (message != null && message.isNotEmpty)
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(
+                    hasError ? Icons.error_outline : Icons.info_outline,
+                    color: hasError ? AppColors.error : AppColors.info,
+                  ),
+                  const SizedBox(width: AppSpacing.space2),
+                  Expanded(
+                    child: Text(
+                      message,
+                      key: const ValueKey('workflow-status-message'),
+                      style: theme.textTheme.bodyMedium,
+                    ),
+                  ),
+                ],
               ),
-            ),
+            if (_sendStatusSyncPending) ...[
+              const SizedBox(height: AppSpacing.space2),
+              Align(
+                alignment: Alignment.centerRight,
+                child: TextButton.icon(
+                  onPressed: _isExecuting ? null : _retrySendStatusSync,
+                  icon: const Icon(Icons.sync),
+                  label: const Text('Retry Status Sync'),
+                ),
+              ),
+            ],
           ],
         ),
       ),
@@ -249,9 +488,7 @@ class _IoReviewScreenState extends State<IoReviewScreen> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
 
-    final canExecute = _currentStatus == RequestState.pendingIoReview &&
-        !_isExecuting &&
-        !_executionSuccessful;
+    final canExecute = _canStartExecution;
 
     return Scaffold(
       appBar: AppBar(
@@ -270,6 +507,33 @@ class _IoReviewScreenState extends State<IoReviewScreen> {
               _buildRequestDetails(theme),
               const SizedBox(height: AppSpacing.space4),
               _buildExecutionInformation(theme),
+              if (_rawResponse != null) ...[
+                const SizedBox(height: AppSpacing.space4),
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(AppSpacing.space4),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('Raw SMS Evidence', style: theme.textTheme.titleMedium),
+                        const SizedBox(height: AppSpacing.space2),
+                        Text('Received: ${_responseReceivedAt?.toIso8601String() ?? "unknown"}'),
+                        Text('Sender: ${_responseSender ?? "unknown"}'),
+                        if (_responseHash != null)
+                          SelectableText('SHA-256: $_responseHash', style: AppTypography.technical),
+                        const Divider(),
+                        SelectableText(_rawResponse!, style: AppTypography.technical),
+                        const SizedBox(height: AppSpacing.space3),
+                        OutlinedButton.icon(
+                          onPressed: _copyResponseForAuthorizedSharing,
+                          icon: const Icon(Icons.copy),
+                          label: const Text('Share Result Report'),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
               const SizedBox(height: AppSpacing.space6),
               _buildExecutionBoundaryNotice(theme),
               const SizedBox(height: AppSpacing.space6),
@@ -287,16 +551,27 @@ class _IoReviewScreenState extends State<IoReviewScreen> {
                           ),
                         )
                       : Icon(
-                          _executionSuccessful
+                          _smsDispatchAccepted
                               ? Icons.check_circle_outline
-                              : Icons.verified_user_outlined,
+                              : _dispatchOutcomeUnknown || _executionOutcomeUnknown
+                                  ? Icons.help_outline
+                                  : Icons.verified_user_outlined,
                         ),
                   label: Text(
                     _isExecuting
-                        ? 'Recording Authorization...'
-                        : _executionSuccessful
-                            ? 'Authorization Recorded'
-                            : 'Authorize Execution',
+                        ? (_sendStatusSyncPending
+                            ? 'Synchronizing Status...'
+                            : 'Processing Execution...')
+                        : _smsDispatchAccepted
+                            ? 'SMS Dispatch Accepted'
+                            : _dispatchOutcomeUnknown || _executionOutcomeUnknown
+                                ? 'Outcome Unknown — Verify Before Retry'
+                                : _authorizationRecorded
+                                    ? 'Execution Authorized'
+                                    : _currentStatus == RequestState.smsFailed
+                                        ? 'SMS Dispatch Failed'
+                                        : 'Authorize Execution',
+                  
                   ),
                 ),
               ),
@@ -439,11 +714,33 @@ class _IoReviewScreenState extends State<IoReviewScreen> {
             ),
             _detailRow(
               'Authorization Status',
-              _executionSuccessful
+              _authorizationRecorded
                   ? 'Recorded'
-                  : _isExecuting
-                      ? 'In progress'
-                      : 'Not recorded',
+                  : _executionOutcomeUnknown
+                      ? 'Outcome unknown — verify before retry'
+                      : _isExecuting
+                          ? 'In progress'
+                          : 'Not recorded',
+            ),
+            _detailRow(
+              'SMS Dispatch Status',
+              _dispatchOutcomeUnknown
+                  ? 'Outcome unknown — do not resend'
+                  : _smsDispatchAccepted
+                      ? 'Accepted by Android; carrier delivery not confirmed'
+                      : _currentStatus == RequestState.smsFailed
+                          ? 'Failed'
+                          : _authorizationRecorded
+                              ? 'Not confirmed'
+                              : 'Not started',
+            ),
+            _detailRow(
+              'Carrier Response Status',
+              _rawResponse != null
+                  ? 'Received and recorded'
+                  : _currentStatus == RequestState.waitingResponse
+                      ? 'Waiting for carrier response'
+                      : 'Not received',
             ),
           ],
         ),
@@ -471,9 +768,8 @@ class _IoReviewScreenState extends State<IoReviewScreen> {
           const SizedBox(width: AppSpacing.space3),
           Expanded(
             child: Text(
-              'This screen records execution authorization only. '
-              'It does not send carrier SMS commands, retrieve '
-              'locations, or collect carrier responses.',
+              'Execution uses the authorized Android device/SIM and approved operator configuration. '
+              'Raw carrier responses are preserved for review; no location is inferred when the carrier format is unknown.',
               style: theme.textTheme.bodySmall?.copyWith(
                 color: AppColors.textPrimary,
               ),

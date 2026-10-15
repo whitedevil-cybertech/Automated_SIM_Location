@@ -100,18 +100,17 @@ async def access_request_link(
         details={"access_method": "token_link"},
     )
     await db_manager.audit_logs.insert_one(event.model_dump(mode="json"))
-    if document.status == RequestState.CREATED:
-        io_review_event = AuditLogDocument(
-            request_id=document.request_id,
-            actor_id=principal.principal_id,
-            actor_role=principal.role,
-            event_type=AuditEventType.IO_REVIEW_STARTED,
-            details={
-                "previous_status": RequestState.CREATED.value,
-                "status": RequestState.PENDING_IO_REVIEW.value,
-            },
-        )
-        await db_manager.audit_logs.insert_one(io_review_event.model_dump(mode="json"))
+    io_review_event = AuditLogDocument(
+        request_id=document.request_id,
+        actor_id=principal.principal_id,
+        actor_role=principal.role,
+        event_type=AuditEventType.IO_REVIEW_STARTED,
+        details={
+            "previous_status": document.status.value,
+            "status": RequestState.PENDING_IO_REVIEW.value,
+        },
+    )
+    await db_manager.audit_logs.insert_one(io_review_event.model_dump(mode="json"))
 
     refreshed = await db_manager.location_requests.find_one(
         {"request_id": document.request_id}

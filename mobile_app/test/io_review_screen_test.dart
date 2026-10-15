@@ -163,9 +163,9 @@ void main() {
         expect(find.text('Request Details'), findsOneWidget);
         expect(find.text('Execution Context'), findsOneWidget);
         expect(
-          find.text('This screen records execution authorization only. '
-              'It does not send carrier SMS commands, retrieve '
-              'locations, or collect carrier responses.'),
+          find.textContaining(
+            'Execution uses the authorized Android device/SIM and approved operator configuration.',
+          ),
           findsOneWidget,
         );
       },
@@ -221,7 +221,7 @@ void main() {
 
         expect(
           find.textContaining(
-            'It does not send SMS messages or retrieve a device location.',
+            'After confirmation, the app may send an SMS from this device only',
           ),
           findsOneWidget,
         );

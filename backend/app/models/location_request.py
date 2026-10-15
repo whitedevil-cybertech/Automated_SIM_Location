@@ -1,7 +1,7 @@
-"""Location Request Document Model for MongoDB.
+"""Location request lifecycle model persisted through PostgreSQL.
 
 Defines the structure, nested subdocuments, and forensic metadata for
-the 'location_requests' collection.
+relational JSONB payloads.
 """
 
 from datetime import datetime, timezone
@@ -26,8 +26,11 @@ class ShareTokenInfo(BaseModel):
 class ExecutionInfo(BaseModel):
     """Details concerning IO execution and device-level SMS dispatch."""
 
+    execution_started_at: Optional[datetime] = Field(
+        default=None, description="When the backend authorized IO execution"
+    )
     dispatched_at: Optional[datetime] = Field(
-        default=None, description="When IO device sent the SMS"
+        default=None, description="When the Android client reported SMS dispatch accepted"
     )
     io_device_id: Optional[str] = Field(
         default=None, description="Identifier of the executing IO device"
@@ -35,6 +38,7 @@ class ExecutionInfo(BaseModel):
     sim_slot_index: Optional[int] = Field(
         default=None, description="SIM slot used on IO device (e.g. 0, 1)"
     )
+    awaiting_response_since: Optional[datetime] = Field(default=None, description="Server timestamp when SMS dispatch was accepted and response wait began")
     attempt_count: int = Field(default=0, description="Number of transmission attempts")
     delivery_status: Optional[str] = Field(
         default=None, description="Delivery receipt or intent status"
@@ -49,7 +53,11 @@ class ResponseInfo(BaseModel):
 
     raw_sms_content: Optional[str] = Field(
         default=None,
-        description="Preserved raw SMS body (sensitive field; masked in display/logs)",
+        description="Decrypted raw SMS body populated only for authorized response handling",
+    )
+    raw_sms_content_encrypted: Optional[str] = Field(
+        default=None,
+        description="Encrypted raw SMS evidence as persisted in PostgreSQL",
     )
     sender_address: Optional[str] = Field(
         default=None, description="Originating carrier shortcode/address"
@@ -86,7 +94,7 @@ class ParsedLocationResult(BaseModel):
 
 
 class LocationRequestDocument(BaseModel):
-    """MongoDB Document Model for the 'location_requests' collection."""
+    """PostgreSQL JSONB payload model for relational JSONB payloads."""
 
     request_id: str = Field(description="Unique opaque ID, e.g. REQ-2026-XXXXX")
     case_id: str = Field(description="Case reference / FIR number")

@@ -109,7 +109,7 @@ class TelephonyBridge {
       return false;
     }
 
-    // Normalize sender representations (e.g. "1512" vs "VK-1512" or "+911512")
+    // Normalize sender representations such as provider-specific alphanumeric prefixes.
     final cleanSender = event.sender.replaceAll(RegExp(r'[\s\-]'), '').toUpperCase();
     final cleanExpected = expectedSender.replaceAll(RegExp(r'[\s\-]'), '').toUpperCase();
 
@@ -129,6 +129,19 @@ class TelephonyBridge {
     }
 
     return true;
+  }
+
+  /// Opens Android's system chooser for an explicit, user-initiated result share.
+  Future<bool> shareText(String text) async {
+    try {
+      return await _channel.invokeMethod<bool>(
+            'shareText',
+            <String, dynamic>{'text': text},
+          ) ??
+          false;
+    } on PlatformException {
+      return false;
+    }
   }
 
   /// Inject synthetic SMS event for automated integration and unit testing.

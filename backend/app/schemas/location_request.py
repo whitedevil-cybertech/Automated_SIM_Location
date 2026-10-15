@@ -93,6 +93,12 @@ class LocationRequestResponse(BaseModel):
     has_parsed_result: bool = Field(
         default=False, description="Whether location result has been extracted"
     )
+    raw_sms_content: Optional[str] = Field(
+        default=None, description="Preserved raw carrier SMS; returned only for authorized request details"
+    )
+    response_sender_address: Optional[str] = None
+    response_received_at: Optional[datetime] = None
+    response_sha256: Optional[str] = None
 
 
 class LocationExecuteRequest(BaseModel):
@@ -125,6 +131,9 @@ class DispatchInstructions(BaseModel):
     sim_slot_index: int = Field(
         default=0,
         description="SIM slot index to use on authorized device",
+    )
+    response_sender: str = Field(
+        description="Provider-approved sender address used to correlate the reply",
     )
 
 

@@ -5,18 +5,18 @@ using pydantic-settings.
 """
 
 from functools import lru_cache
-from typing import Dict, Literal, Optional
+from typing import Dict, Literal, Optional, List
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
+from pathlib import Path
 
 class Settings(BaseSettings):
     """Core application settings."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
+      env_file=Path(__file__).resolve().parents[2] / ".env",
+      env_file_encoding="utf-8",
+      extra="ignore",
     )
 
     # Application metadata
@@ -46,18 +46,15 @@ class Settings(BaseSettings):
     port: int = Field(default=8000, description="Bind port")
     api_v1_prefix: str = Field(default="/api/v1", description="API v1 route prefix")
 
-    # MongoDB configuration
-    mongodb_uri: str = Field(
-        default="mongodb://localhost:27017",
-        description="MongoDB connection string",
+    # PostgreSQL configuration
+    database_url: str = Field(
+        default="postgresql+psycopg://localhost:5432/ifso_location",
+        description="SQLAlchemy async PostgreSQL URL; provide via DATABASE_URL.",
     )
-    mongodb_database: str = Field(
-        default="ifso_location_dev",
-        description="MongoDB database name",
-    )
-    mongodb_min_pool_size: int = Field(default=10, description="Connection pool minimum")
-    mongodb_max_pool_size: int = Field(default=50, description="Connection pool maximum")
-    mongodb_timeout_ms: int = Field(default=3000, description="Connection timeout in ms")
+    database_name: str = Field(default="ifso_location", description="Logical database name for health reporting")
+    database_pool_size: int = Field(default=10, description="SQLAlchemy connection pool size")
+    database_max_overflow: int = Field(default=20, description="Maximum overflow connections")
+    database_pool_timeout_seconds: int = Field(default=3, description="Pool checkout timeout in seconds")
 
     # Security configuration (Phase 2+ Auth Placeholder)
     secret_key: str = Field(
@@ -75,12 +72,15 @@ class Settings(BaseSettings):
             "development/testing; production must use an external identity provider."
         ),
     )
+    external_auth_jwks_url: Optional[str] = Field(default=None, description="Trusted identity provider JWKS endpoint")
+    external_auth_issuer: Optional[str] = Field(default=None, description="Expected JWT issuer")
+    external_auth_audience: Optional[str] = Field(default=None, description="Expected JWT audience")
+    external_auth_role_claim: str = Field(default="role", description="JWT claim containing a single application role")
+    external_auth_subject_claim: str = Field(default="sub", description="JWT claim identifying the authenticated user")
+    timeout_worker_interval_seconds: int = Field(default=30, ge=5, le=300, description="Polling interval for request timeout transitions")
+    cors_allowed_origins: List[str] = Field(default_factory=list, description="Explicit browser origins; empty disables browser CORS")
     development_auth_tokens: Dict[str, str] = Field(
-        default_factory=lambda: {
-            "dev-officer-token": "OFFICER-DEV-001:OFFICER",
-            "dev-io-token": "IO-DEV-001:IO",
-            "dev-admin-token": "ADMIN-DEV-001:ADMIN",
-        },
+        default_factory=dict,
         description=(
             "Development-only bearer token mapping: token -> principal_id:ROLE. "
             "Never use as production authentication."
@@ -89,7 +89,7 @@ class Settings(BaseSettings):
     field_encryption_key: Optional[str] = Field(
         default=None,
         description=(
-            "Fernet key used for reversible encryption of sensitive MongoDB fields. "
+            "Fernet key used for reversible encryption of sensitive fields. "
             "Required outside development/testing."
         ),
     )
@@ -102,10 +102,6 @@ class Settings(BaseSettings):
     sms_timeout_minutes: int = Field(
         default=5,
         description="Awaiting response timeout window in minutes",
-    )
-    max_sms_retries: int = Field(
-        default=2,
-        description="Maximum retry attempts on SMS transmission failure",
     )
 
 
