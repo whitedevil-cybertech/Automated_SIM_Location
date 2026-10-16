@@ -40,6 +40,18 @@ class ApiService {
   final String? authToken;
   final http.Client _client;
 
+  ApiService copyWith({
+    String? baseUrl,
+    String? authToken,
+    http.Client? client,
+  }) {
+    return ApiService(
+      baseUrl: baseUrl ?? this.baseUrl,
+      authToken: authToken ?? this.authToken,
+      client: client ?? _client,
+    );
+  }
+
   Uri _buildUri(String path) {
     final normalizedBaseUrl = baseUrl.replaceFirst(RegExp(r'/+$'), '');
     final normalizedPath = path.replaceFirst(RegExp(r'^/+'), '');
@@ -621,6 +633,13 @@ class ApiService {
         return 'The request is no longer awaiting IO review.';
 
       case 'VALIDATION_ERROR':
+        if (_isOperatorConfigurationRequired(body)) {
+          final backendMsg = error is Map<String, dynamic> ? error['message'] : null;
+          return backendMsg is String && backendMsg.trim().isNotEmpty
+              ? backendMsg.trim()
+              : 'No approved SMS configuration exists for this operator.';
+        }
+
         if (_isOperatorInactive(body)) {
           return 'The selected operator is not approved or is currently inactive.';
         }
@@ -693,6 +712,18 @@ class ApiService {
     }
   }
 
+  bool _isOperatorConfigurationRequired(Map<String, dynamic>? body) {
+    final error = body?['error'];
+    if (error is! Map<String, dynamic>) {
+      return false;
+    }
+    final details = error['details'];
+    if (details is! Map<String, dynamic>) {
+      return false;
+    }
+    return details['configuration_required'] == true;
+  }
+
   bool _isOperatorInactive(Map<String, dynamic>? body) {
     final error = body?['error'];
 
@@ -707,6 +738,10 @@ class ApiService {
     final details = error['details'];
 
     if (details is! Map<String, dynamic>) {
+      return false;
+    }
+
+    if (details['configuration_required'] == true) {
       return false;
     }
 

@@ -21,6 +21,7 @@ class HomeScreen extends StatelessWidget {
     required this.ioDeviceId,
     this.simSlotIndex = 0,
     this.telephonyBridge,
+    this.onLogout,
   });
 
   final ApiService apiService;
@@ -29,6 +30,7 @@ class HomeScreen extends StatelessWidget {
   final String ioDeviceId;
   final int simSlotIndex;
   final TelephonyBridge? telephonyBridge;
+  final VoidCallback? onLogout;
 
   @override
   Widget build(BuildContext context) {
@@ -51,6 +53,36 @@ class HomeScreen extends StatelessWidget {
               );
             },
           ),
+          if (onLogout != null)
+            IconButton(
+              icon: const Icon(Icons.logout),
+              tooltip: 'Log Out',
+              onPressed: () async {
+                final confirm = await showDialog<bool>(
+                  context: context,
+                  builder: (ctx) => AlertDialog(
+                    title: const Text('Log Out'),
+                    content: const Text(
+                      'Are you sure you want to end your authenticated session? '
+                      'You will need to re-authenticate to access operational workflows.',
+                    ),
+                    actions: [
+                      TextButton(
+                        onPressed: () => Navigator.of(ctx).pop(false),
+                        child: const Text('Cancel'),
+                      ),
+                      FilledButton(
+                        onPressed: () => Navigator.of(ctx).pop(true),
+                        child: const Text('Log Out'),
+                      ),
+                    ],
+                  ),
+                );
+                if (confirm == true) {
+                  onLogout!();
+                }
+              },
+            ),
         ],
       ),
       body: SafeArea(
@@ -172,12 +204,15 @@ class HomeScreen extends StatelessWidget {
             color: AppColors.textSecondary,
           ),
         ),
-        const Spacer(),
-        Text(
-          value,
-          style: AppTypography.technicalBold.copyWith(
-            fontSize: 12,
-            color: AppColors.primary,
+        const SizedBox(width: AppSpacing.space2),
+        Expanded(
+          child: Text(
+            value,
+            textAlign: TextAlign.end,
+            style: AppTypography.technicalBold.copyWith(
+              fontSize: 12,
+              color: AppColors.primary,
+            ),
           ),
         ),
       ],

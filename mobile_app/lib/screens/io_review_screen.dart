@@ -112,38 +112,28 @@ class _IoReviewScreenState extends State<IoReviewScreen> {
   Future<void> _executeRequest() async {
     if (!_canStartExecution) return;
 
-    final bridge = widget.telephonyBridge;
-    if (bridge == null) {
-      setState(() {
-        _errorMessage = 'Android SMS bridge is unavailable. No SMS was sent.';
-        _workflowMessage = null;
-      });
-      return;
-    }
-
     setState(() {
       _isExecuting = true;
       _errorMessage = null;
-      _workflowMessage =
-          'Checking SMS permissions and approved operator configuration...';
+      _workflowMessage = 'Recording execution authorization...';
     });
 
     try {
-      final permissionGranted = await bridge.checkSmsPermission();
-      if (!permissionGranted) {
-        final granted = await bridge.requestSmsPermission();
-        if (!granted) {
-          throw const ApiException(
-            statusCode: 403,
-            code: 'SMS_PERMISSION_DENIED',
-            message: 'SMS permissions were denied by the device or device policy.',
-          );
+      final bridge = widget.telephonyBridge;
+      if (bridge != null) {
+        final permissionGranted = await bridge.checkSmsPermission();
+        if (!permissionGranted) {
+          final granted = await bridge.requestSmsPermission();
+          if (!granted) {
+            throw const ApiException(
+              statusCode: 403,
+              code: 'SMS_PERMISSION_DENIED',
+              message: 'SMS permissions were denied by the device or device policy.',
+            );
+          }
         }
       }
 
-      setState(() {
-        _workflowMessage = 'Requesting execution authorization from the server...';
-      });
       final execution = await widget.apiService.executeLocationRequest(
         requestId: widget.request.requestId,
         ioDeviceId: widget.ioDeviceId,
@@ -157,6 +147,13 @@ class _IoReviewScreenState extends State<IoReviewScreen> {
         _currentStatus = RequestState.executing;
         _workflowMessage = 'Authorization recorded. Validating approved dispatch instructions...';
       });
+
+      if (bridge == null) {
+        setState(() {
+          _workflowMessage = 'Execution authorization recorded. No SMS was sent by this screen.';
+        });
+        return;
+      }
 
       final data = execution['data'];
       if (data is! Map || data['dispatch_instructions'] is! Map) {
@@ -223,8 +220,9 @@ class _IoReviewScreenState extends State<IoReviewScreen> {
       }
     } on ApiException catch (error) {
       if (!mounted) return;
-      final uncertainServerOutcome = !_authorizationRecorded &&
-          (error.isNetworkError || error.statusCode == 0 || error.statusCode >= 500);
+      final isTimeout = error.message.toLowerCase().contains('took too long') ||
+          error.message.toLowerCase().contains('timed out');
+      final uncertainServerOutcome = !_authorizationRecorded && isTimeout;
       setState(() {
         _isExecuting = false;
         if (_dispatchOutcomeUnknown) {
@@ -337,11 +335,13 @@ class _IoReviewScreenState extends State<IoReviewScreen> {
       case 'SMS_PERMISSION_DENIED':
         return 'SMS permissions were denied by the device or device policy.';
       case 'VALIDATION_ERROR':
-        // ApiService already maps known operator validation errors. Do not
-        // mislabel every validation error as an inactive operator.
-        return error.message.isNotEmpty
-            ? error.message
-            : 'The submitted request data could not be validated.';
+        if (error.message.contains('SMS configuration') ||
+            error.message.contains('SMS destination') ||
+            error.message.contains('SMS template') ||
+            error.message.contains('response sender')) {
+          return error.message;
+        }
+        return 'Operator is not approved or currently inactive.';
       case 'NETWORK_ERROR':
         return error.message.isNotEmpty
             ? error.message
@@ -561,13 +561,13 @@ class _IoReviewScreenState extends State<IoReviewScreen> {
                     _isExecuting
                         ? (_sendStatusSyncPending
                             ? 'Synchronizing Status...'
-                            : 'Processing Execution...')
+                            : 'Recording Authorization...')
                         : _smsDispatchAccepted
                             ? 'SMS Dispatch Accepted'
                             : _dispatchOutcomeUnknown || _executionOutcomeUnknown
                                 ? 'Outcome Unknown — Verify Before Retry'
                                 : _authorizationRecorded
-                                    ? 'Execution Authorized'
+                                    ? 'Authorization Recorded'
                                     : _currentStatus == RequestState.smsFailed
                                         ? 'SMS Dispatch Failed'
                                         : 'Authorize Execution',
@@ -768,6 +768,8 @@ class _IoReviewScreenState extends State<IoReviewScreen> {
           const SizedBox(width: AppSpacing.space3),
           Expanded(
             child: Text(
+              'This screen records execution authorization only. '
+              'It does not send carrier SMS commands without explicit authorization. '
               'Execution uses the authorized Android device/SIM and approved operator configuration. '
               'Raw carrier responses are preserved for review; no location is inferred when the carrier format is unknown.',
               style: theme.textTheme.bodySmall?.copyWith(
