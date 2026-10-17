@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 
-import '../core/constants/request_states.dart';
 import '../core/theme/color_schemes.dart';
 import '../core/theme/radius.dart';
 import '../core/theme/spacing.dart';
@@ -9,9 +8,9 @@ import '../services/api_service.dart';
 import '../services/telephony_bridge.dart';
 import 'io_pending_requests_screen.dart';
 import 'officer_request_screen.dart';
+import 'role_dashboard_panel.dart';
 
-/// Application Shell / Home Dashboard for Phase 1.
-/// Establishes the visual hierarchy, layout tokens, and forensic status indicators.
+/// Role-aware application shell with backend-backed dashboard data.
 class HomeScreen extends StatelessWidget {
   const HomeScreen({
     super.key,
@@ -40,19 +39,6 @@ class HomeScreen extends StatelessWidget {
       appBar: AppBar(
         title: const Text('IFSO Location Management'),
         actions: [
-          IconButton(
-            icon: const Icon(Icons.shield_outlined),
-            tooltip: 'Security Status',
-            onPressed: () {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text(
-                    'Audit events are recorded. Tamper resistance depends on database and deployment controls.',
-                  ),
-                ),
-              );
-            },
-          ),
           if (onLogout != null)
             IconButton(
               icon: const Icon(Icons.logout),
@@ -92,23 +78,16 @@ class HomeScreen extends StatelessWidget {
             vertical: AppSpacing.space4,
           ),
           children: [
-            // Phase Banner
-            _buildPhaseBanner(theme),
-            const SizedBox(height: AppSpacing.space4),
-
-            // System Information Card
-            _buildSystemStatusCard(theme),
+            RoleDashboardPanel(
+              apiService: apiService,
+              role: role,
+            ),
             const SizedBox(height: AppSpacing.space4),
 
             // The role is resolved by /auth/me; UI visibility is not the security boundary.
             _buildRoleWorkflowSection(context, theme),
-            const SizedBox(height: AppSpacing.space6),
+            if (role != 'ADMIN') const SizedBox(height: AppSpacing.space4),
 
-            // Request Lifecycle State Tokens
-            _buildLifecycleStateTokens(theme),
-            const SizedBox(height: AppSpacing.space6),
-
-            // Forensic Disclaimer
             _buildForensicDisclaimer(theme),
           ],
         ),
@@ -116,124 +95,11 @@ class HomeScreen extends StatelessWidget {
     );
   }
 
-  Widget _buildPhaseBanner(ThemeData theme) {
-    return Container(
-      padding: const EdgeInsets.all(AppSpacing.space4),
-      decoration: BoxDecoration(
-        color: AppColors.primaryContainer,
-        borderRadius: AppRadius.borderMedium,
-        border: Border.all(color: AppColors.primary.withAlpha(50)),
-      ),
-      child: Row(
-        children: [
-          const Icon(
-            Icons.foundation_outlined,
-            color: AppColors.primary,
-            size: 28,
-          ),
-          const SizedBox(width: AppSpacing.space3),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  'Operational MVP — Request Workflow',
-                  style: theme.textTheme.titleMedium?.copyWith(
-                    color: AppColors.primary,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-                const SizedBox(height: AppSpacing.space1),
-                Text(
-                  'Authenticated, role-specific request workflows with audited lifecycle transitions.',
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    color: AppColors.primary,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildSystemStatusCard(ThemeData theme) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(AppSpacing.space4),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('System Environment', style: theme.textTheme.titleMedium),
-            const SizedBox(height: AppSpacing.space2),
-            const Divider(),
-            const SizedBox(height: AppSpacing.space2),
-            _buildStatusRow(
-              'Deployment Tier',
-              'Internal MDM Managed',
-              Icons.verified_user_outlined,
-            ),
-            const SizedBox(height: AppSpacing.space2),
-            _buildStatusRow(
-              'Backend API',
-              'FastAPI /api/v1 (configured)',
-              Icons.cloud_done_outlined,
-            ),
-            const SizedBox(height: AppSpacing.space2),
-            _buildStatusRow(
-              'Audit Trail',
-              'Recorded events; DB hardening required',
-              Icons.receipt_long_outlined,
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildStatusRow(String label, String value, IconData icon) {
-    return Row(
-      children: [
-        Icon(icon, size: 18, color: AppColors.secondary),
-        const SizedBox(width: AppSpacing.space2),
-        Text(
-          label,
-          style: const TextStyle(
-            fontSize: 13,
-            color: AppColors.textSecondary,
-          ),
-        ),
-        const SizedBox(width: AppSpacing.space2),
-        Expanded(
-          child: Text(
-            value,
-            textAlign: TextAlign.end,
-            style: AppTypography.technicalBold.copyWith(
-              fontSize: 12,
-              color: AppColors.primary,
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-
   Widget _buildRoleWorkflowSection(BuildContext context, ThemeData theme) {
     if (role == 'ADMIN') {
-      return Card(
-        child: Padding(
-          padding: const EdgeInsets.all(AppSpacing.space4),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text('Administrator', style: theme.textTheme.titleMedium),
-              const SizedBox(height: AppSpacing.space2),
-              const Text('Admin screens are outside the current MVP. No request execution controls are exposed for this role.'),
-            ],
-          ),
-        ),
-      );
+      // The live, read-only administrative overview is rendered above.
+      // Unsupported mutation capabilities are disclosed there, not simulated.
+      return const SizedBox.shrink();
     }
     if (role != 'OFFICER' && role != 'IO') {
       return const Card(child: Padding(padding: EdgeInsets.all(16), child: Text('Unknown role. Access is denied.')));
@@ -361,52 +227,6 @@ class HomeScreen extends StatelessWidget {
               ),
             ),
           ],
-        ),
-      ],
-    );
-  }
-
-  Widget _buildLifecycleStateTokens(ThemeData theme) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text('Request Lifecycle States', style: theme.textTheme.titleMedium),
-        const SizedBox(height: AppSpacing.space1),
-        Text(
-          'Audited state machine transitions defined per architecture:',
-          style: theme.textTheme.bodySmall,
-        ),
-        const SizedBox(height: AppSpacing.space3),
-        Wrap(
-          spacing: AppSpacing.space2,
-          runSpacing: AppSpacing.space2,
-          children: RequestState.values.map((state) {
-            return Container(
-              padding: const EdgeInsets.symmetric(
-                horizontal: AppSpacing.space3,
-                vertical: AppSpacing.space2,
-              ),
-              decoration: BoxDecoration(
-                color: state.containerColor,
-                borderRadius: AppRadius.borderSmall,
-                border: Border.all(color: state.color.withAlpha(80)),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(state.icon, size: 14, color: state.color),
-                  const SizedBox(width: AppSpacing.space1),
-                  Text(
-                    state.value,
-                    style: AppTypography.technicalBold.copyWith(
-                      fontSize: 11,
-                      color: state.color,
-                    ),
-                  ),
-                ],
-              ),
-            );
-          }).toList(),
         ),
       ],
     );

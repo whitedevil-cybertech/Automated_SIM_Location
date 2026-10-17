@@ -45,6 +45,15 @@ operators_table = Table(
     Column("is_active", Boolean, nullable=False, server_default=text("true")),
     Column("payload", JSONB, nullable=False),
 )
+users_table = Table(
+    "user_accounts", metadata,
+    Column("user_id", String(255), primary_key=True),
+    Column("email", String(320), nullable=False, unique=True, index=True),
+    Column("status", String(32), nullable=False, index=True),
+    Column("role", String(32), nullable=False, index=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("payload", JSONB, nullable=False),
+)
 audit_logs_table = Table(
     "audit_logs", metadata,
     Column("audit_id", String(80), primary_key=True),
@@ -58,6 +67,7 @@ audit_logs_table = Table(
 TABLES = {
     "location_requests": location_requests_table,
     "operators": operators_table,
+    "user_accounts": users_table,
     "audit_logs": audit_logs_table,
 }
 
@@ -90,6 +100,8 @@ def _flatten_payload(payload: dict, table: Table) -> dict:
         }
     if table is operators_table:
         return {"operator_code": p["operator_code"], "is_active": bool(p.get("is_active", True)), "payload": p}
+    if table is users_table:
+        return {"user_id": p["user_id"], "email": p["email"].lower(), "status": p["status"], "role": p["requested_role"], "created_at": _dt(p["created_at"]), "payload": p}
     return {
         "audit_id": p["audit_id"], "request_id": p.get("request_id"),
         "timestamp": _dt(p.get("timestamp")), "actor_id": p["actor_id"],
@@ -237,6 +249,10 @@ class DatabaseManager:
     def operators(self):
         db = self.get_database()
         return db._collections["operators"] if db is self else db["operators"]
+    @property
+    def user_accounts(self):
+        db = self.get_database()
+        return db._collections["user_accounts"] if db is self else db["user_accounts"]
     @property
     def audit_logs(self):
         db = self.get_database()

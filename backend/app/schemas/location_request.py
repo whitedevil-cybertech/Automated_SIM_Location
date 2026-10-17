@@ -30,6 +30,9 @@ class LocationRequestCreate(BaseModel):
         description="Telecom operator identifier code",
         examples=["JIO", "AIRTEL", "VI", "BSNL"],
     )
+    assigned_io_id: str = Field(
+        default="", max_length=255, description="Approved IO account assigned to this request; required by the request-creation route"
+    )
     remarks: Optional[str] = Field(
         default=None,
         max_length=500,
@@ -168,4 +171,4 @@ class LocationResultSubmission(BaseModel):
         default=None,
         description="Device timestamp when SMS reply was intercepted",
     )
-
+    

@@ -47,7 +47,12 @@ router = APIRouter(prefix="/requests", tags=["Location Requests"])
 
 
 def _build_shareable_link(request: Request, raw_token: str) -> str:
-    return str(request.url_for("access_request_link", token=raw_token))
+    # Public app-facing base is configurable independently from the API host.
+    settings = get_settings()
+    public_base = getattr(settings, "public_share_base_url", None)
+    if public_base and public_base.strip():
+        return f"{public_base.rstrip('/')}/{raw_token}"
+    return f"ifso://request/{raw_token}"
 
 
 def _to_response(
@@ -203,6 +208,15 @@ async def create_request(
     """Create and persist a new officer location request."""
     require_role(principal, UserRole.OFFICER, UserRole.ADMIN)
 
+    # IO assignment must resolve to a currently approved account; arbitrary IDs are rejected.
+    io_account = await db_manager.user_accounts.find_one({"user_id": payload.assigned_io_id.strip()})
+    if not io_account or io_account.get("status") != "APPROVED" or io_account.get("requested_role") != "IO":
+        raise ValidationException(
+            message="Assigned IO does not exist or is not an approved IO account.",
+            field="assigned_io_id",
+            details={"assigned_io_id": payload.assigned_io_id},
+        )
+
     if not await _is_operator_active(payload.operator_code):
         raise ValidationException(
             message="Operator is not approved or currently inactive.",
@@ -220,6 +234,7 @@ async def create_request(
         operator_code=payload.operator_code,
         submitting_officer_id=officer_id,
         remarks=payload.remarks,
+        executing_io_id=payload.assigned_io_id.strip(),
     )
 
     await db_manager.location_requests.insert_one(document.model_dump(mode="json"))
@@ -265,14 +280,16 @@ async def get_pending_io_requests(
     async for data in cursor:
         data.pop("_id", None)
         document = LocationRequestDocument.model_validate(data)
-        is_pending = document.status == RequestState.PENDING_IO_REVIEW
+        is_assigned = document.executing_io_id == principal.principal_id
+        is_pending = document.status == RequestState.PENDING_IO_REVIEW and is_assigned
         is_shared_created = (
             document.status == RequestState.CREATED
+            and is_assigned
             and document.share_token is not None
             and not document.share_token.is_used
             and document.share_token.expires_at > datetime.now(timezone.utc)
         )
-        if is_pending or is_shared_created:
+        if principal.role == UserRole.ADMIN or is_pending or is_shared_created:
             documents.append(_to_response(document))
 
     return ApiResponse(
@@ -280,6 +297,93 @@ async def get_pending_io_requests(
         message="Pending IO requests retrieved successfully.",
         data=documents,
     )
+
+@router.get(
+    "/my",
+    response_model=ApiResponse[list[LocationRequestResponse]],
+    status_code=status.HTTP_200_OK,
+    summary="List requests created by the authenticated officer",
+)
+async def get_my_requests(
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+    limit: int = 50,
+    offset: int = 0,
+) -> ApiResponse[list[LocationRequestResponse]]:
+    """Return only the current officer's requests; identity is never client-supplied."""
+    require_role(principal, UserRole.OFFICER)
+    if limit < 1 or limit > 100 or offset < 0:
+        raise ValidationException(message="Invalid pagination values.", field="pagination")
+    cursor = db_manager.location_requests.find(
+        {"submitting_officer_id": principal.principal_id}
+    ).sort("created_at", -1)
+    records = []
+    async for data in cursor:
+        data.pop("_id", None)
+        records.append(_to_response(
+            LocationRequestDocument.model_validate(data)
+        ).model_copy(update={
+            "raw_sms_content": None,
+            "response_sender_address": None,
+            "response_received_at": None,
+            "response_sha256": None,
+        }))
+    return ApiResponse(success=True, message="Officer requests retrieved.", data=records[offset:offset + limit])
+
+
+@router.get(
+    "/io/visible",
+    response_model=ApiResponse[list[LocationRequestResponse]],
+    status_code=status.HTTP_200_OK,
+    summary="List requests visible to the authenticated IO",
+)
+async def get_io_visible_requests(
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+    limit: int = 50,
+    offset: int = 0,
+) -> ApiResponse[list[LocationRequestResponse]]:
+    """Return the current IO's permitted review/processing queue using existing access policy."""
+    require_role(principal, UserRole.IO)
+    if limit < 1 or limit > 100 or offset < 0:
+        raise ValidationException(message="Invalid pagination values.", field="pagination")
+    cursor = db_manager.location_requests.find({}).sort("created_at", -1)
+    records = []
+    now = datetime.now(timezone.utc)
+    async for data in cursor:
+        data.pop("_id", None)
+        document = LocationRequestDocument.model_validate(data)
+        shared = document.share_token is not None and (
+            not document.share_token.is_used
+            and document.share_token.expires_at > now
+        )
+        # Match the existing queue policy for pending review. Once execution starts,
+        # only the IO recorded as executor can see the request in their tracking list.
+        visible = (
+            principal.role == UserRole.ADMIN
+            or (
+                document.executing_io_id == principal.principal_id
+                and (
+                    document.status == RequestState.PENDING_IO_REVIEW
+                    or shared
+                    or document.status in {
+                        RequestState.EXECUTING,
+                        RequestState.WAITING_RESPONSE,
+                        RequestState.COMPLETED,
+                        RequestState.SMS_FAILED,
+                        RequestState.TIMEOUT,
+                        RequestState.RESPONSE_INVALID,
+                    }
+                )
+            )
+        )
+        if visible:
+            records.append(_to_response(document).model_copy(update={
+                "raw_sms_content": None,
+                "response_sender_address": None,
+                "response_received_at": None,
+                "response_sha256": None,
+            }))
+    return ApiResponse(success=True, message="IO requests retrieved.", data=records[offset:offset + limit])
+
 
 @router.get(
     "/{request_id}",

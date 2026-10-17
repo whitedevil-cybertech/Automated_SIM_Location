@@ -27,7 +27,7 @@ void main() {
 
   testWidgets('Admin sees no request execution controls in MVP', (tester) async {
     await tester.pumpWidget(buildHome('ADMIN'));
-    expect(find.text('Administrator'), findsOneWidget);
+    expect(find.text('System Overview'), findsOneWidget);
     expect(find.text('Officer Module'), findsNothing);
     expect(find.text('IO Execution'), findsNothing);
   });

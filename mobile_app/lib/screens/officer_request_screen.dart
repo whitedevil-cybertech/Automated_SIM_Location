@@ -24,11 +24,29 @@ class _OfficerRequestScreenState extends State<OfficerRequestScreen> {
 
   static const _operators = <String>['JIO', 'AIRTEL', 'VI', 'BSNL'];
   String _operatorCode = 'JIO';
+  List<Map<String, dynamic>> _eligibleIos = [];
+  String? _assignedIoId;
+  bool _loadingIos = true;
   bool _isSubmitting = false;
   bool _isMintingLink = false;
   String? _errorMessage;
   LocationRequest? _createdRequest;
   String? _shareableLink;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadEligibleIos();
+  }
+
+  Future<void> _loadEligibleIos() async {
+    try {
+      final ios = await widget.apiService.getEligibleIos();
+      if (mounted) setState(() { _eligibleIos = ios; _loadingIos = false; });
+    } catch (_) {
+      if (mounted) setState(() => _loadingIos = false);
+    }
+  }
 
   @override
   void dispose() {
@@ -43,6 +61,10 @@ class _OfficerRequestScreenState extends State<OfficerRequestScreen> {
     
     FocusScope.of(context).unfocus();
     if (!_formKey.currentState!.validate()) return;
+    if (_assignedIoId == null || _assignedIoId!.isEmpty) {
+      setState(() => _errorMessage = 'Select an approved IO. If the list is empty, ask an administrator to approve an IO enrollment.');
+      return;
+    }
 
     final normalizedPhoneNumber = _phoneController.text
     .replaceAll(RegExp(r'[\s-]'), '');
@@ -57,6 +79,7 @@ class _OfficerRequestScreenState extends State<OfficerRequestScreen> {
         targetPhoneNumber: normalizedPhoneNumber,
         operatorCode: _operatorCode,
         remarks: _remarksController.text,
+        assignedIoId: _assignedIoId ?? '',
       );
       if (!mounted) return;
 
@@ -230,6 +253,22 @@ class _OfficerRequestScreenState extends State<OfficerRequestScreen> {
                                       });
                                     }
                                   },
+                          ),
+                          const SizedBox(height: AppSpacing.space3),
+                          DropdownButtonFormField<String>(
+                            value: _assignedIoId,
+                            decoration: const InputDecoration(
+                              labelText: 'Assigned IO',
+                              prefixIcon: Icon(Icons.assignment_ind_outlined),
+                              border: OutlineInputBorder(),
+                            ),
+                            hint: Text(_loadingIos ? 'Loading approved IOs…' : 'Select an approved IO'),
+                            items: _eligibleIos.map((io) => DropdownMenuItem<String>(
+                              value: io['user_id'] as String,
+                              child: Text('${io['full_name']} (${io['user_id']})'),
+                            )).toList(),
+                            onChanged: _isSubmitting ? null : (value) => setState(() => _assignedIoId = value),
+                            validator: (value) => value == null ? 'Select an approved IO.' : null,
                           ),
                           const SizedBox(height: AppSpacing.space3),
                           TextFormField(

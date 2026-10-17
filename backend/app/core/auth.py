@@ -113,10 +113,24 @@ async def get_current_principal(
                 detail="Invalid authentication credentials.",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        return principal
+    else:
+        # JWKS retrieval may perform blocking network I/O; keep it off the event loop.
+        principal = await asyncio.to_thread(_verify_external_jwt, credentials.credentials, settings)
 
-    # JWKS retrieval may perform blocking network I/O; keep it off the event loop.
-    return await asyncio.to_thread(_verify_external_jwt, credentials.credentials, settings)
+    # Enforce local enrollment approval for any identity represented in the account registry.
+    # Existing externally provisioned identities without a local enrollment remain governed
+    # by the configured identity provider.
+    try:
+        from backend.app.core.database import db_manager
+        if db_manager.is_connected:
+            account = await db_manager.user_accounts.find_one({"user_id": principal.principal_id})
+            if account and account.get("status") != "APPROVED":
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is pending administrator approval or is disabled.")
+            if account and account.get("requested_role") != principal.role.value:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="The authenticated role does not match the approved account role.")
+    except HTTPException:
+        raise
+    return principal
 
 
 def require_role(principal: AuthenticatedPrincipal, *allowed_roles: UserRole) -> None:

@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../core/theme/color_schemes.dart';
 import '../core/theme/radius.dart';
 import '../core/theme/spacing.dart';
+import '../services/api_service.dart';
 
 /// Screen guiding officers through the authorized IFSO account provisioning workflow.
 ///
@@ -13,9 +14,11 @@ class SignupScreen extends StatefulWidget {
   const SignupScreen({
     super.key,
     required this.onNavigateToLogin,
+    required this.apiService,
   });
 
   final VoidCallback onNavigateToLogin;
+  final ApiService apiService;
 
   @override
   State<SignupScreen> createState() => _SignupScreenState();
@@ -30,6 +33,9 @@ class _SignupScreenState extends State<SignupScreen> {
   final _phoneController = TextEditingController();
 
   bool _isSubmitted = false;
+  bool _isSubmitting = false;
+  String _requestedRole = 'OFFICER';
+  String? _submissionError;
 
   @override
   void dispose() {
@@ -41,13 +47,26 @@ class _SignupScreenState extends State<SignupScreen> {
     super.dispose();
   }
 
-  void _submitEnrollment() {
-    if (!_formKey.currentState!.validate()) {
-      return;
+  Future<void> _submitEnrollment() async {
+    if (!_formKey.currentState!.validate() || _isSubmitting) return;
+    setState(() { _isSubmitting = true; _submissionError = null; });
+    try {
+      await widget.apiService.submitEnrollment(
+        userId: _badgeNumberController.text,
+        fullName: _officerNameController.text,
+        email: _emailController.text,
+        unit: _unitController.text,
+        phone: _phoneController.text,
+        requestedRole: _requestedRole,
+      );
+      if (mounted) setState(() => _isSubmitted = true);
+    } on ApiException catch (e) {
+      if (mounted) setState(() => _submissionError = e.message);
+    } catch (_) {
+      if (mounted) setState(() => _submissionError = 'Unable to submit enrollment. Check network and retry.');
+    } finally {
+      if (mounted) setState(() => _isSubmitting = false);
     }
-    setState(() {
-      _isSubmitted = true;
-    });
   }
 
   @override
@@ -215,6 +234,14 @@ class _SignupScreenState extends State<SignupScreen> {
           ),
           const SizedBox(height: AppSpacing.space3),
 
+          DropdownButtonFormField<String>(
+            value: _requestedRole,
+            decoration: const InputDecoration(labelText: 'Account type', prefixIcon: Icon(Icons.badge_outlined), border: OutlineInputBorder()),
+            items: const [DropdownMenuItem(value: 'OFFICER', child: Text('Officer')), DropdownMenuItem(value: 'IO', child: Text('Investigating Officer (IO)'))],
+            onChanged: _isSubmitting ? null : (value) { if (value != null) setState(() => _requestedRole = value); },
+          ),
+          const SizedBox(height: AppSpacing.space3),
+
           // Phone Number
           TextFormField(
             controller: _phoneController,
@@ -238,10 +265,14 @@ class _SignupScreenState extends State<SignupScreen> {
           const SizedBox(height: AppSpacing.space6),
 
           // Submit Button
+          if (_submissionError != null) ...[
+            Text(_submissionError!, style: theme.textTheme.bodyMedium?.copyWith(color: AppColors.error)),
+            const SizedBox(height: AppSpacing.space2),
+          ],
           FilledButton.icon(
-            onPressed: _submitEnrollment,
-            icon: const Icon(Icons.send_outlined),
-            label: const Text('Submit Enrollment Request'),
+            onPressed: _isSubmitting ? null : _submitEnrollment,
+            icon: _isSubmitting ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)) : const Icon(Icons.send_outlined),
+            label: Text(_isSubmitting ? 'Submitting…' : 'Submit Enrollment Request'),
             style: FilledButton.styleFrom(
               padding: const EdgeInsets.symmetric(vertical: 14),
               shape: RoundedRectangleBorder(
@@ -283,7 +314,7 @@ class _SignupScreenState extends State<SignupScreen> {
           ),
           const SizedBox(height: AppSpacing.space2),
           Text(
-            'Your enrollment request for Officer ID "${_badgeNumberController.text.trim()}" has been recorded for administrative verification.',
+            'Your ${_requestedRole == 'IO' ? 'IO' : 'Officer'} enrollment request for ID "${_badgeNumberController.text.trim()}" has been submitted. An administrator must approve it before access can be provisioned.',
             style: theme.textTheme.bodyMedium?.copyWith(
               color: AppColors.textSecondary,
               height: 1.4,

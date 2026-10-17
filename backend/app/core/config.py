@@ -95,6 +95,7 @@ class Settings(BaseSettings):
     )
 
     # Operational lifecycle configuration
+    public_share_base_url: Optional[str] = Field(default=None, description="Externally reachable application/share-link base URL; do not set to an API endpoint")
     request_token_expire_hours: int = Field(
         default=24,
         description="Shareable token expiration window in hours",

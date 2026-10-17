@@ -61,6 +61,9 @@ async def access_request_link(
     data.pop("_id", None)
     document = LocationRequestDocument.model_validate(data)
 
+    if principal.role == UserRole.IO and document.executing_io_id != principal.principal_id:
+        raise ResourceNotFoundError(message="Invalid or expired request link.")
+
     share_token = document.share_token
     now = datetime.now(timezone.utc)
     if (

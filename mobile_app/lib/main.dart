@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'package:app_links/app_links.dart';
 import 'package:flutter/material.dart';
 
 import 'core/theme/app_theme.dart';
@@ -101,11 +103,72 @@ class _AppAuthGateState extends State<_AppAuthGate> {
   _AuthFlowState _state = _AuthFlowState.loading;
   AuthSession? _activeSession;
   String? _loginErrorMessage;
+  final AppLinks _appLinks = AppLinks();
+  StreamSubscription<Uri>? _linkSubscription;
+  String? _pendingShareToken;
+  bool _redeemingShareLink = false;
 
   @override
   void initState() {
     super.initState();
     _resolveInitialSession();
+    _initializeDeepLinks();
+  }
+
+  Future<void> _initializeDeepLinks() async {
+    try {
+      final initial = await _appLinks.getInitialLink();
+      if (initial != null) _handleIncomingLink(initial);
+      _linkSubscription = _appLinks.uriLinkStream.listen(_handleIncomingLink);
+    } catch (_) {
+      // App remains usable if link-intent APIs are unavailable on this device.
+    }
+  }
+
+  void _handleIncomingLink(Uri uri) {
+    if (uri.scheme != 'ifso' || uri.host != 'request' || uri.pathSegments.isEmpty) return;
+    final token = uri.pathSegments.last.trim();
+    if (token.isEmpty) return;
+    _pendingShareToken = token;
+    if (_state == _AuthFlowState.authenticated && _activeSession != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _redeemPendingShareLink());
+    }
+  }
+
+  Future<void> _redeemPendingShareLink() async {
+    final token = _pendingShareToken;
+    final session = _activeSession;
+    if (token == null || session == null || _redeemingShareLink || !mounted) return;
+    if (session.role != 'IO' && session.role != 'ADMIN') {
+      _pendingShareToken = null;
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Only an authorized IO can open a shared request.')));
+      return;
+    }
+    _redeemingShareLink = true;
+    try {
+      final api = widget.baseApiService.copyWith(authToken: session.token);
+      final response = await api.accessRequestLink(token);
+      _pendingShareToken = null;
+      if (!mounted) return;
+      final data = response['data'];
+      final caseId = data is Map ? data['case_id']?.toString() ?? 'Unknown case' : 'Unknown case';
+      final requestId = data is Map ? data['request_id']?.toString() ?? '' : '';
+      await showDialog<void>(context: context, builder: (context) => AlertDialog(
+        title: const Text('Shared request opened'),
+        content: Text('Case: $caseId\nRequest: $requestId\nThe request is now available in your IO queue.'),
+        actions: [TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('OK'))],
+      ));
+    } catch (_) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Unable to open shared request. Verify that you are signed in as the assigned IO and that the link has not expired.')));
+    } finally {
+      _redeemingShareLink = false;
+    }
+  }
+
+  @override
+  void dispose() {
+    _linkSubscription?.cancel();
+    super.dispose();
   }
 
   Future<void> _resolveInitialSession() async {
@@ -140,14 +203,15 @@ class _AppAuthGateState extends State<_AppAuthGate> {
     final savedSession = await widget.sessionManager.getSession();
     if (savedSession != null) {
       if (savedSession.isBiometricEnabled) {
-        final isBioAvailable = await widget.biometricService.isBiometricAvailable();
-        if (isBioAvailable && mounted) {
+        // Never silently bypass a configured biometric lock when the device cannot
+        // provide biometrics. The unlock screen allows explicit credential login.
+        if (mounted) {
           setState(() {
             _activeSession = savedSession;
             _state = _AuthFlowState.biometricUnlock;
           });
-          return;
         }
+        return;
       }
 
       // Re-verify stored session token against server
@@ -216,6 +280,7 @@ class _AppAuthGateState extends State<_AppAuthGate> {
       _loginErrorMessage = null;
       _state = _AuthFlowState.authenticated;
     });
+    WidgetsBinding.instance.addPostFrameCallback((_) => _redeemPendingShareLink());
   }
 
   void _onNavigateToSignUp() {
@@ -237,6 +302,7 @@ class _AppAuthGateState extends State<_AppAuthGate> {
       _loginErrorMessage = null;
       _state = _AuthFlowState.authenticated;
     });
+    WidgetsBinding.instance.addPostFrameCallback((_) => _redeemPendingShareLink());
   }
 
   void _onBiometricSwitchAccount() async {
@@ -283,6 +349,7 @@ class _AppAuthGateState extends State<_AppAuthGate> {
 
       case _AuthFlowState.signup:
         return SignupScreen(
+          apiService: widget.baseApiService,
           onNavigateToLogin: _onNavigateToLogin,
         );
 
@@ -308,6 +375,9 @@ class _AppAuthGateState extends State<_AppAuthGate> {
         );
 
       case _AuthFlowState.authenticated:
+        if (_pendingShareToken != null) {
+          WidgetsBinding.instance.addPostFrameCallback((_) => _redeemPendingShareLink());
+        }
         final session = _activeSession!;
         final authenticatedApiService = widget.baseApiService.copyWith(
           authToken: session.token,

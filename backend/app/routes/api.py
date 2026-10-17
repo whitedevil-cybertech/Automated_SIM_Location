@@ -6,6 +6,7 @@ from backend.app.routes.auth import router as auth_router
 from backend.app.routes.operators import router as operators_router
 from backend.app.routes.request_links import router as request_links_router
 from backend.app.routes.requests import router as requests_router
+from backend.app.routes.admin import router as admin_router
 
 api_v1_router = APIRouter()
 
@@ -15,3 +16,5 @@ api_v1_router.include_router(auth_router)
 api_v1_router.include_router(requests_router)
 api_v1_router.include_router(request_links_router)
 api_v1_router.include_router(operators_router)
+
+api_v1_router.include_router(admin_router)

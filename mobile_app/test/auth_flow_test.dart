@@ -136,37 +136,107 @@ void main() {
 
   group('SignupScreen Tests', () {
     testWidgets('validates required fields and shows policy banner', (tester) async {
+      final mockClient = MockClient((request) async {
+        if (request.method == 'POST' &&
+            request.url.path.endsWith('/auth/signup')) {
+          return http.Response(
+            jsonEncode({
+              'success': true,
+              'message': 'Enrollment request submitted.',
+              'data': {
+                'user_id': 'PIS-28910042',
+                'status': 'PENDING',
+              },
+            }),
+            201,
+            headers: {'content-type': 'application/json'},
+          );
+        }
+
+        return http.Response(
+          jsonEncode({
+            'success': false,
+            'error': {
+              'code': 'NOT_FOUND',
+              'message': 'Endpoint not found.',
+            },
+          }),
+          404,
+          headers: {'content-type': 'application/json'},
+        );
+      });
+
+      final apiService = ApiService(
+        baseUrl: 'http://localhost/api/v1',
+        client: mockClient,
+      );
+
       await tester.pumpWidget(
         MaterialApp(
-          home: SignupScreen(onNavigateToLogin: () {}),
+          home: SignupScreen(
+            onNavigateToLogin: () {},
+            apiService: apiService,
+          ),
         ),
       );
 
       expect(find.text('Account Provisioning Policy'), findsOneWidget);
       expect(find.textContaining('cannot self-assign IO'), findsOneWidget);
 
-      // Attempt to submit empty form
+      // Submitting an empty form must show validation errors.
       final submitButton = find.byType(FilledButton);
-      await tester.scrollUntilVisible(submitButton, 200, scrollable: find.byType(Scrollable).first);
+
+      await tester.scrollUntilVisible(
+        submitButton,
+        200,
+        scrollable: find.byType(Scrollable).first,
+      );
+
       await tester.tap(submitButton);
       await tester.pumpAndSettle();
 
       expect(find.text('Please enter your full name.'), findsOneWidget);
-      expect(find.text('Please enter your official badge/PIS number.'), findsOneWidget);
+      expect(
+        find.text('Please enter your official badge/PIS number.'),
+        findsOneWidget,
+      );
 
-      // Fill valid information
-      await tester.enterText(find.byType(TextFormField).at(0), 'Insp. Anuj Sharma');
-      await tester.enterText(find.byType(TextFormField).at(1), 'PIS-28910042');
-      await tester.enterText(find.byType(TextFormField).at(2), 'anuj@delhipolice.gov.in');
-      await tester.enterText(find.byType(TextFormField).at(3), 'IFSO Cyber Cell');
-      await tester.enterText(find.byType(TextFormField).at(4), '9876543210');
+      // Complete all required fields.
+      await tester.enterText(
+        find.byType(TextFormField).at(0),
+        'Insp. Anuj Sharma',
+      );
+      await tester.enterText(
+        find.byType(TextFormField).at(1),
+        'PIS-28910042',
+      );
+      await tester.enterText(
+        find.byType(TextFormField).at(2),
+        'anuj@delhipolice.gov.in',
+      );
+      await tester.enterText(
+        find.byType(TextFormField).at(3),
+        'IFSO Cyber Cell',
+      );
+      await tester.enterText(
+        find.byType(TextFormField).at(4),
+        '9876543210',
+      );
 
-      await tester.scrollUntilVisible(submitButton, 200, scrollable: find.byType(Scrollable).first);
+      await tester.scrollUntilVisible(
+        submitButton,
+        200,
+        scrollable: find.byType(Scrollable).first,
+      );
+
       await tester.tap(submitButton);
       await tester.pumpAndSettle();
 
       expect(find.text('Enrollment Request Logged'), findsOneWidget);
-      expect(find.textContaining('Next Steps for Account Activation'), findsOneWidget);
+      expect(
+        find.textContaining('Next Steps for Account Activation'),
+        findsOneWidget,
+      );
     });
   });
 

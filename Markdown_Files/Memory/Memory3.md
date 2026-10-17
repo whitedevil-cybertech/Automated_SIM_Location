@@ -108,3 +108,8 @@ The Flutter mobile application now provides the IO Review execution boundary def
 
 ```text
 POST /api/v1/requests/{request_id}/execute
+```
+
+## Dashboard Cleanup — 2026-10-16
+
+Implemented backend-backed role dashboard data: Officer-owned requests, IO-visible requests, and Admin aggregate monitoring with recent audit metadata. The Flutter home screen now displays real role-scoped request counts and masked request cards instead of hardcoded deployment information and static lifecycle-token filler. Admin account management and operator configuration mutation remain unimplemented and are disclosed rather than simulated. Full backend integration tests and Flutter analysis/build remain blocked by missing PostgreSQL driver/service and Flutter SDK in the editing environment. See `IMPLEMENTATION_STATUS.md` for exact validation details.

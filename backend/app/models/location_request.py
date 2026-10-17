@@ -155,6 +155,7 @@ class LocationRequestDocument(BaseModel):
         operator_code: str,
         submitting_officer_id: str,
         remarks: Optional[str] = None,
+        executing_io_id: Optional[str] = None,
         share_token: Optional[ShareTokenInfo] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> "LocationRequestDocument":
@@ -172,6 +173,7 @@ class LocationRequestDocument(BaseModel):
             target_phone_hash=hashed,
             operator_code=operator_code.upper().strip(),
             submitting_officer_id=submitting_officer_id.strip(),
+            executing_io_id=executing_io_id.strip() if executing_io_id else None,
             status=RequestState.CREATED,
             created_at=now,
             updated_at=now,

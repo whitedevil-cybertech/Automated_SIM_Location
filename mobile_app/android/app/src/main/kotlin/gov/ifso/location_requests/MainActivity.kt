@@ -13,7 +13,7 @@ import android.telephony.SmsManager
 import android.telephony.SubscriptionManager
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.android.FlutterFragmentActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -27,7 +27,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * - Handles Android SEND_SMS permission checks.
  * - Forwards incoming carrier SMS replies received by [SmsResponseReceiver] to Flutter.
  */
-class MainActivity : FlutterActivity() {
+class MainActivity : FlutterFragmentActivity() {
 
     companion object {
         const val CHANNEL_NAME = "gov.ifso.location_requests/telephony"

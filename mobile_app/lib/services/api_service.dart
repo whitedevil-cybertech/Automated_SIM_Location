@@ -106,6 +106,7 @@ class ApiService {
     required String targetPhoneNumber,
     required String operatorCode,
     String? remarks,
+    required String assignedIoId,
   }) async {
     final body = await _postJson(
       '/requests',
@@ -113,6 +114,7 @@ class ApiService {
         'case_id': caseId.trim(),
         'target_phone_number': targetPhoneNumber.trim(),
         'operator_code': operatorCode.trim().toUpperCase(),
+        'assigned_io_id': assignedIoId.trim(),
         if (remarks != null && remarks.trim().isNotEmpty)
           'remarks': remarks.trim(),
       },
@@ -120,6 +122,25 @@ class ApiService {
     );
 
     return _parseLocationRequest(body['data']);
+  }
+
+  Future<Map<String, dynamic>> accessRequestLink(String token) async {
+    return _getJson('/request-links/${Uri.encodeComponent(token)}');
+  }
+
+  Future<List<Map<String, dynamic>>> getEligibleIos() async {
+    return _getJsonList('/auth/eligible-ios');
+  }
+
+  Future<Map<String, dynamic>> submitEnrollment({
+    required String userId, required String fullName, required String email,
+    required String unit, required String phone, required String requestedRole,
+  }) async {
+    return _postJson('/auth/signup', {
+      'user_id': userId.trim(), 'full_name': fullName.trim(),
+      'email': email.trim(), 'unit': unit.trim(), 'phone': phone.trim(),
+      'requested_role': requestedRole,
+    }, operation: 'signup');
   }
 
   /// Mints a one-time bearer link after an explicit officer action.
@@ -243,6 +264,126 @@ class ApiService {
         message: 'The server returned invalid request data.',
       );
     }
+  }
+
+  Future<Map<String, dynamic>> _getJson(String path) async {
+    final uri = _buildUri(path);
+    final headers = <String, String>{'Accept': 'application/json'};
+    final token = authToken;
+    if (token != null && token.isNotEmpty) {
+      headers['Authorization'] = 'Bearer $token';
+    }
+
+    http.Response response;
+    try {
+      response = await _client.get(uri, headers: headers)
+          .timeout(const Duration(seconds: 15));
+    } on TimeoutException {
+      throw const ApiException.network(message: 'The server took too long to respond.');
+    } on SocketException {
+      throw const ApiException.network(message: 'Unable to connect to the server.');
+    } on http.ClientException {
+      throw const ApiException.network(message: 'Unable to communicate with the server.');
+    }
+
+    final body = _decodeResponse(response.body);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw ApiException(
+        statusCode: response.statusCode,
+        code: _extractErrorCode(body),
+        message: _safeErrorMessage(response.statusCode, body),
+      );
+    }
+    if (body == null || body['success'] != true || body['data'] is! Map) {
+      throw const ApiException(
+        statusCode: 500,
+        code: 'INVALID_RESPONSE',
+        message: 'The server returned an invalid dashboard response.',
+      );
+    }
+    return Map<String, dynamic>.from(body['data'] as Map);
+  }
+
+  Future<List<LocationRequest>> _getRequestList(String path) async {
+    final body = await _getJsonList(path);
+    try {
+      return body.map((item) => _parseLocationRequest(item)).toList(growable: false);
+    } catch (_) {
+      throw const ApiException(
+        statusCode: 500,
+        code: 'INVALID_RESPONSE',
+        message: 'The server returned invalid request data.',
+      );
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> _getJsonList(String path) async {
+    final uri = _buildUri(path);
+    final headers = <String, String>{'Accept': 'application/json'};
+    final token = authToken;
+    if (token != null && token.isNotEmpty) {
+      headers['Authorization'] = 'Bearer $token';
+    }
+    http.Response response;
+    try {
+      response = await _client.get(uri, headers: headers)
+          .timeout(const Duration(seconds: 15));
+    } on TimeoutException {
+      throw const ApiException.network(message: 'The server took too long to respond.');
+    } on SocketException {
+      throw const ApiException.network(message: 'Unable to connect to the server.');
+    } on http.ClientException {
+      throw const ApiException.network(message: 'Unable to communicate with the server.');
+    }
+    final body = _decodeResponse(response.body);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw ApiException(
+        statusCode: response.statusCode,
+        code: _extractErrorCode(body),
+        message: _safeErrorMessage(response.statusCode, body),
+      );
+    }
+    if (body == null || body['success'] != true || body['data'] is! List) {
+      throw const ApiException(
+        statusCode: 500,
+        code: 'INVALID_RESPONSE',
+        message: 'The server returned an invalid request list.',
+      );
+    }
+    return (body['data'] as List).map((item) {
+      if (item is! Map) {
+        throw const ApiException(
+          statusCode: 500,
+          code: 'INVALID_RESPONSE',
+          message: 'The server returned an invalid request entry.',
+        );
+      }
+      return Map<String, dynamic>.from(item);
+    }).toList(growable: false);
+  }
+
+  Future<List<LocationRequest>> getMyRequests({int limit = 50, int offset = 0}) {
+    return _getRequestList('/requests/my?limit=$limit&offset=$offset');
+  }
+
+  Future<List<LocationRequest>> getIoVisibleRequests({int limit = 50, int offset = 0}) {
+    return _getRequestList('/requests/io/visible?limit=$limit&offset=$offset');
+  }
+
+  Future<List<Map<String, dynamic>>> getAdminAccounts({String status = 'PENDING_APPROVAL'}) {
+    return _getJsonList('/admin/accounts?status=${Uri.encodeQueryComponent(status)}');
+  }
+
+  Future<void> decideAdminAccount(String userId, {required bool approve}) async {
+    await _postJson('/admin/accounts/${Uri.encodeComponent(userId)}/${approve ? 'approve' : 'reject'}', const <String, dynamic>{}, operation: 'account-decision');
+  }
+
+  Future<Map<String, dynamic>> getAdminDashboard() {
+    return _getJson('/admin/dashboard');
+  }
+
+  Future<List<LocationRequest>> getAdminRequests({int limit = 50, int offset = 0}) {
+    return _getRequestList('/admin/requests?limit=$limit&offset=$offset');
   }
 
   /// Retrieves requests that are awaiting IO review.
